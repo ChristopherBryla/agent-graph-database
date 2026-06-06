@@ -1,0 +1,1071 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Genesys Pipeline Editor</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #0f1117;
+      color: #e2e8f0;
+      height: 100vh;
+      display: flex;
+      overflow: hidden;
+    }
+
+    /* ── Sidebar tabs ──────────────────────────────────────────────────────── */
+    #sidebar-tabs {
+      display: flex;
+      border-bottom: 1px solid #2d3148;
+      margin-bottom: 4px;
+    }
+    .tab-btn {
+      flex: 1;
+      background: none;
+      border: none;
+      border-bottom: 2px solid transparent;
+      color: #64748b;
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: .05em;
+      padding: 10px 0;
+      text-transform: uppercase;
+      transition: color .15s, border-color .15s;
+    }
+    .tab-btn:hover { color: #94a3b8; }
+    .tab-btn.active { border-bottom-color: #6366f1; color: #e2e8f0; }
+
+    #tab-pipelines, #tab-components {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    #component-list { flex: 1; overflow-y: auto; }
+
+    .component-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 9px 20px;
+      cursor: pointer;
+      font-size: 13px;
+      color: #94a3b8;
+      transition: background .15s, color .15s;
+    }
+    .component-item:hover { background: #252840; color: #e2e8f0; }
+    .component-item.active { background: #252840; color: #fff; }
+    .comp-badge {
+      font-size: 9px;
+      font-weight: 700;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+      padding: 2px 5px;
+      border-radius: 4px;
+      flex-shrink: 0;
+    }
+    .badge-plugin { background: #312e81; color: #a5b4fc; }
+    .badge-builtin { background: #1e3a2f; color: #6ee7b7; }
+
+    #new-component-btn {
+      margin: 16px;
+      padding: 9px;
+      background: #334155;
+      color: #e2e8f0;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 600;
+      transition: background .15s;
+    }
+    #new-component-btn:hover { background: #475569; }
+
+    /* ── Component editor modal ──────────────────────────────────────────── */
+    #comp-modal-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: #0009;
+      align-items: center;
+      justify-content: center;
+      z-index: 300;
+    }
+    #comp-modal-overlay.open { display: flex; }
+    #comp-modal {
+      background: #1a1d27;
+      border: 1px solid #3d4166;
+      border-radius: 12px;
+      padding: 24px;
+      width: min(780px, 95vw);
+      max-height: 90vh;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    #comp-modal h3 { font-size: 16px; }
+    #comp-modal input {
+      background: #0f1117;
+      border: 1px solid #2d3148;
+      border-radius: 6px;
+      padding: 8px 12px;
+      color: #e2e8f0;
+      font-size: 14px;
+      outline: none;
+      width: 100%;
+    }
+    #comp-modal input:focus { border-color: #6366f1; }
+    #comp-source {
+      flex: 1;
+      min-height: 340px;
+      background: #0b0d14;
+      border: 1px solid #2d3148;
+      border-radius: 6px;
+      color: #e2e8f0;
+      font-family: "Fira Code", "Cascadia Code", "Consolas", monospace;
+      font-size: 13px;
+      line-height: 1.6;
+      outline: none;
+      padding: 14px;
+      resize: vertical;
+      tab-size: 4;
+      width: 100%;
+    }
+    #comp-source:focus { border-color: #6366f1; }
+    .comp-modal-btns { display: flex; gap: 10px; justify-content: flex-end; }
+
+    /* ── Sidebar ─────────────────────────────────────────────────────────── */
+    #sidebar {
+      width: 240px;
+      min-width: 240px;
+      background: #1a1d27;
+      border-right: 1px solid #2d3148;
+      display: flex;
+      flex-direction: column;
+      padding: 20px 0;
+    }
+
+    #sidebar h2 {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .1em;
+      color: #64748b;
+      padding: 0 20px 12px;
+    }
+
+    #runtime-list { flex: 1; overflow-y: auto; }
+
+    .runtime-item {
+      padding: 10px 20px;
+      cursor: pointer;
+      border-left: 3px solid transparent;
+      font-size: 14px;
+      color: #94a3b8;
+      transition: background .15s, color .15s;
+    }
+    .runtime-item:hover { background: #252840; color: #e2e8f0; }
+    .runtime-item.active { border-left-color: #6366f1; background: #252840; color: #fff; font-weight: 600; }
+
+    #new-btn {
+      margin: 16px;
+      padding: 9px;
+      background: #6366f1;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 600;
+      transition: background .15s;
+    }
+    #new-btn:hover { background: #4f52d3; }
+
+    /* ── Main area ───────────────────────────────────────────────────────── */
+    #main {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    #toolbar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 14px 24px;
+      border-bottom: 1px solid #2d3148;
+      background: #13151f;
+    }
+
+    #pipeline-name {
+      flex: 1;
+      background: #1e2130;
+      border: 1px solid #3d4166;
+      border-radius: 6px;
+      padding: 8px 12px;
+      color: #e2e8f0;
+      font-size: 15px;
+      font-weight: 600;
+      outline: none;
+    }
+    #pipeline-name:focus { border-color: #6366f1; }
+
+    .btn {
+      padding: 8px 18px;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 600;
+      transition: background .15s;
+    }
+    .btn-primary { background: #6366f1; color: #fff; }
+    .btn-primary:hover { background: #4f52d3; }
+    .btn-danger { background: #dc2626; color: #fff; }
+    .btn-danger:hover { background: #b91c1c; }
+    .btn-secondary { background: #334155; color: #e2e8f0; }
+    .btn-secondary:hover { background: #475569; }
+
+    /* ── Canvas ──────────────────────────────────────────────────────────── */
+    #canvas {
+      flex: 1;
+      overflow-y: auto;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    #empty-state {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      color: #475569;
+      gap: 10px;
+    }
+    #empty-state svg { opacity: .3; }
+    #empty-state p { font-size: 15px; }
+
+    /* ── Node card ───────────────────────────────────────────────────────── */
+    .node-card {
+      background: #1a1d27;
+      border: 1px solid #2d3148;
+      border-radius: 10px;
+      overflow: hidden;
+    }
+
+    .node-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 12px 16px;
+      background: #1e2130;
+      border-bottom: 1px solid #2d3148;
+    }
+
+    .node-index {
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      background: #6366f1;
+      color: #fff;
+      font-size: 11px;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+
+    .node-header h3 { flex: 1; font-size: 13px; color: #94a3b8; }
+
+    .node-remove {
+      background: none;
+      border: none;
+      color: #475569;
+      cursor: pointer;
+      font-size: 18px;
+      line-height: 1;
+      padding: 2px 6px;
+      border-radius: 4px;
+    }
+    .node-remove:hover { background: #dc262622; color: #dc2626; }
+
+    .node-body { padding: 16px; display: flex; flex-direction: column; gap: 14px; }
+
+    /* ── Form row ────────────────────────────────────────────────────────── */
+    .field-row {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+    .field-row label {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      color: #64748b;
+    }
+    .field-row input, .field-row select {
+      background: #0f1117;
+      border: 1px solid #2d3148;
+      border-radius: 6px;
+      padding: 8px 10px;
+      color: #e2e8f0;
+      font-size: 13px;
+      outline: none;
+    }
+    .field-row input:focus, .field-row select:focus { border-color: #6366f1; }
+
+    /* ── Inputs table ────────────────────────────────────────────────────── */
+    .inputs-section { display: flex; flex-direction: column; gap: 8px; }
+    .inputs-section label {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      color: #64748b;
+    }
+
+    .input-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    .input-row input {
+      flex: 1;
+      background: #0f1117;
+      border: 1px solid #2d3148;
+      border-radius: 6px;
+      padding: 7px 10px;
+      color: #e2e8f0;
+      font-size: 13px;
+      outline: none;
+      font-family: "Fira Code", "Cascadia Code", monospace;
+    }
+    .input-row input:focus { border-color: #6366f1; }
+    .input-row input.key { flex: 0 0 140px; color: #a78bfa; }
+    .input-sep { color: #475569; font-size: 13px; }
+
+    .btn-icon {
+      background: none;
+      border: none;
+      color: #475569;
+      cursor: pointer;
+      font-size: 16px;
+      padding: 4px 7px;
+      border-radius: 4px;
+    }
+    .btn-icon:hover { background: #dc262622; color: #dc2626; }
+
+    .add-input-btn {
+      align-self: flex-start;
+      background: none;
+      border: 1px dashed #3d4166;
+      border-radius: 6px;
+      color: #64748b;
+      cursor: pointer;
+      font-size: 12px;
+      padding: 5px 12px;
+      transition: border-color .15s, color .15s;
+    }
+    .add-input-btn:hover { border-color: #6366f1; color: #a78bfa; }
+
+    /* ── Depends-on chips ────────────────────────────────────────────────── */
+    .depends-section { display: flex; flex-direction: column; gap: 6px; }
+    .depends-section label {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      color: #64748b;
+    }
+    .chip-row { display: flex; flex-wrap: wrap; gap: 6px; }
+    .dep-chip {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      background: #252840;
+      border: 1px solid #3d4166;
+      border-radius: 20px;
+      padding: 4px 10px;
+      font-size: 12px;
+      color: #a78bfa;
+    }
+    .dep-chip button {
+      background: none;
+      border: none;
+      color: #64748b;
+      cursor: pointer;
+      font-size: 14px;
+      line-height: 1;
+      padding: 0;
+    }
+    .dep-chip button:hover { color: #dc2626; }
+
+    .add-dep-row { display: flex; gap: 8px; align-items: center; }
+    .add-dep-row select {
+      flex: 1;
+      background: #0f1117;
+      border: 1px dashed #3d4166;
+      border-radius: 6px;
+      padding: 6px 10px;
+      color: #64748b;
+      font-size: 12px;
+      outline: none;
+    }
+    .add-dep-row select:focus { border-color: #6366f1; }
+
+    /* ── Add node button ─────────────────────────────────────────────────── */
+    #add-node-btn {
+      align-self: center;
+      background: none;
+      border: 2px dashed #3d4166;
+      border-radius: 10px;
+      color: #64748b;
+      cursor: pointer;
+      font-size: 14px;
+      padding: 14px 40px;
+      width: 100%;
+      max-width: 400px;
+      transition: border-color .15s, color .15s;
+    }
+    #add-node-btn:hover { border-color: #6366f1; color: #a78bfa; }
+
+    /* ── Toast ───────────────────────────────────────────────────────────── */
+    #toast {
+      position: fixed;
+      bottom: 28px;
+      left: 50%;
+      transform: translateX(-50%) translateY(60px);
+      background: #1e2130;
+      border: 1px solid #3d4166;
+      border-radius: 8px;
+      padding: 12px 22px;
+      font-size: 13px;
+      color: #e2e8f0;
+      transition: transform .25s, opacity .25s;
+      opacity: 0;
+      pointer-events: none;
+      z-index: 100;
+    }
+    #toast.show { transform: translateX(-50%) translateY(0); opacity: 1; }
+    #toast.success { border-color: #22c55e; color: #86efac; }
+    #toast.error { border-color: #dc2626; color: #fca5a5; }
+
+    /* ── New pipeline modal ──────────────────────────────────────────────── */
+    #modal-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: #0008;
+      align-items: center;
+      justify-content: center;
+      z-index: 200;
+    }
+    #modal-overlay.open { display: flex; }
+    #modal {
+      background: #1a1d27;
+      border: 1px solid #3d4166;
+      border-radius: 12px;
+      padding: 28px;
+      width: 340px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    #modal h3 { font-size: 16px; }
+    #modal input {
+      background: #0f1117;
+      border: 1px solid #2d3148;
+      border-radius: 6px;
+      padding: 9px 12px;
+      color: #e2e8f0;
+      font-size: 14px;
+      outline: none;
+      width: 100%;
+    }
+    #modal input:focus { border-color: #6366f1; }
+    #modal-hint { font-size: 11px; color: #475569; }
+    .modal-btns { display: flex; gap: 10px; justify-content: flex-end; }
+  </style>
+</head>
+<body>
+
+<!-- ── Sidebar ──────────────────────────────────────────────────────────── -->
+<aside id="sidebar">
+  <div id="sidebar-tabs">
+    <button class="tab-btn active" onclick="switchTab('pipelines')">Pipelines</button>
+    <button class="tab-btn"        onclick="switchTab('components')">Components</button>
+  </div>
+
+  <div id="tab-pipelines">
+    <div id="runtime-list"></div>
+    <button id="new-btn">+ New Pipeline</button>
+  </div>
+
+  <div id="tab-components" style="display:none">
+    <div id="component-list"></div>
+    <button id="new-component-btn">+ New Component</button>
+  </div>
+</aside>
+
+<!-- ── Main ─────────────────────────────────────────────────────────────── -->
+<main id="main">
+  <div id="toolbar">
+    <input id="pipeline-name" type="text" placeholder="pipeline name" readonly />
+    <button class="btn btn-secondary" id="run-btn" style="display:none">▶ Run</button>
+    <button class="btn btn-danger"    id="delete-btn" style="display:none">Delete</button>
+    <button class="btn btn-primary"   id="save-btn" style="display:none">Save</button>
+  </div>
+
+  <div id="canvas">
+    <div id="empty-state">
+      <svg width="56" height="56" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+        <rect x="3" y="3" width="18" height="18" rx="2"/>
+        <path d="M3 9h18M9 21V9"/>
+      </svg>
+      <p>Select a pipeline or create a new one</p>
+    </div>
+  </div>
+</main>
+
+<!-- ── New pipeline modal ────────────────────────────────────────────────── -->
+<div id="modal-overlay">
+  <div id="modal">
+    <h3>New Pipeline</h3>
+    <input id="modal-name" type="text" placeholder="e.g. scoring_v3" />
+    <p id="modal-hint">Lowercase letters, digits and underscores only.</p>
+    <div class="modal-btns">
+      <button class="btn btn-secondary" id="modal-cancel">Cancel</button>
+      <button class="btn btn-primary"   id="modal-create">Create</button>
+    </div>
+  </div>
+</div>
+<!-- ── Component editor modal ─────────────────────────────────────────────── -->
+<div id="comp-modal-overlay">
+  <div id="comp-modal">
+    <h3 id="comp-modal-title">New Component</h3>
+    <div class="field-row">
+      <label>Component Name (becomes the filename and YAML key)</label>
+      <input id="comp-name" type="text" placeholder="e.g. my_model" />
+    </div>
+    <div class="field-row" style="flex:1;display:flex;flex-direction:column">
+      <label>Python Source</label>
+      <textarea id="comp-source"></textarea>
+    </div>
+    <div class="comp-modal-btns">
+      <button class="btn btn-secondary" id="comp-modal-cancel">Cancel</button>
+      <button class="btn btn-danger"    id="comp-delete-btn"    style="display:none">Delete</button>
+      <button class="btn btn-primary"   id="comp-save-btn">Save &amp; Register</button>
+    </div>
+  </div>
+</div>
+<!-- ── Toast ─────────────────────────────────────────────────────────────── -->
+<div id="toast"></div>
+
+<script>
+// ── State ──────────────────────────────────────────────────────────────────
+let components = [];        // registered adapter names from the API
+let currentRuntime = null;  // name of the pipeline being edited
+let nodes = [];             // [{id, component, depends_on, inputs}]
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+const BASE = '';  // same origin
+
+async function apiFetch(path, opts = {}) {
+  const r = await fetch(BASE + path, opts);
+  return { ok: r.ok, status: r.status, data: r.ok ? await r.json() : await r.json().catch(() => ({})) };
+}
+
+let toastTimer;
+function toast(msg, type = 'success') {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = `show ${type}`;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.className = ''; }, 3000);
+}
+
+// ── Boot ───────────────────────────────────────────────────────────────────
+async function boot() {
+  const [rt, comp] = await Promise.all([
+    apiFetch('/v2/runtimes'),
+    apiFetch('/v2/components'),
+  ]);
+  allComponentInfo = comp.data;
+  components = comp.data.user || [];   // pipeline dropdown uses user-facing components only
+  renderSidebar(rt.data.runtime_types || []);
+}
+
+// ── Sidebar ────────────────────────────────────────────────────────────────
+function renderSidebar(runtimes) {
+  const list = document.getElementById('runtime-list');
+  list.innerHTML = '';
+  for (const name of runtimes) {
+    const el = document.createElement('div');
+    el.className = 'runtime-item' + (name === currentRuntime ? ' active' : '');
+    el.textContent = name;
+    el.onclick = () => loadPipeline(name);
+    list.appendChild(el);
+  }
+}
+
+async function refreshSidebar() {
+  const rt = await apiFetch('/v2/runtimes');
+  renderSidebar(rt.data.runtime_types || []);
+}
+
+// ── Load pipeline ──────────────────────────────────────────────────────────
+async function loadPipeline(name) {
+  currentRuntime = name;
+  const { ok, data } = await apiFetch(`/v2/pipelines/${name}/config`);
+  if (!ok) { toast(`Could not load "${name}"`, 'error'); return; }
+
+  nodes = (data.nodes || []).map(n => ({
+    id:         n.id || '',
+    component:  n.component || '',
+    depends_on: n.depends_on || [],
+    inputs:     Object.entries(n.inputs || {}).map(([k, v]) => ({ key: k, value: String(v) })),
+  }));
+
+  document.getElementById('pipeline-name').value = name;
+  document.getElementById('pipeline-name').readOnly = true;
+  document.getElementById('save-btn').style.display   = '';
+  document.getElementById('delete-btn').style.display = '';
+  document.getElementById('run-btn').style.display    = '';
+
+  refreshSidebar();
+  renderCanvas();
+}
+
+// ── Canvas ─────────────────────────────────────────────────────────────────
+function renderCanvas() {
+  const canvas = document.getElementById('canvas');
+  canvas.innerHTML = '';
+
+  if (nodes.length === 0) {
+    canvas.innerHTML = `<div id="empty-state" style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#475569;gap:10px"><p>No nodes yet. Click "+ Add Node" below.</p></div>`;
+  }
+
+  nodes.forEach((node, idx) => canvas.appendChild(buildNodeCard(node, idx)));
+
+  const addBtn = document.createElement('button');
+  addBtn.id = 'add-node-btn';
+  addBtn.textContent = '+ Add Node';
+  addBtn.onclick = addNode;
+  canvas.appendChild(addBtn);
+}
+
+function buildNodeCard(node, idx) {
+  const card = document.createElement('div');
+  card.className = 'node-card';
+  card.dataset.idx = idx;
+
+  // ── Header
+  const hdr = document.createElement('div');
+  hdr.className = 'node-header';
+  hdr.innerHTML = `
+    <div class="node-index">${idx + 1}</div>
+    <h3>Node ${idx + 1}</h3>
+    <button class="node-remove" title="Remove node">×</button>`;
+  hdr.querySelector('.node-remove').onclick = () => { nodes.splice(idx, 1); renderCanvas(); };
+  card.appendChild(hdr);
+
+  // ── Body
+  const body = document.createElement('div');
+  body.className = 'node-body';
+
+  // id
+  body.appendChild(fieldRow('Node ID', 'text', node.id, 'e.g. fetch', v => { node.id = v; refreshDepChips(); }));
+
+  // component
+  const compRow = document.createElement('div');
+  compRow.className = 'field-row';
+  compRow.innerHTML = `<label>Component</label>`;
+  const sel = document.createElement('select');
+  components.forEach(c => {
+    const opt = document.createElement('option');
+    opt.value = c; opt.textContent = c;
+    if (c === node.component) opt.selected = true;
+    sel.appendChild(opt);
+  });
+  sel.onchange = e => { node.component = e.target.value; };
+  compRow.appendChild(sel);
+  body.appendChild(compRow);
+
+  // depends_on
+  body.appendChild(buildDependsOn(node, idx));
+
+  // inputs
+  body.appendChild(buildInputs(node));
+
+  card.appendChild(body);
+  return card;
+}
+
+function fieldRow(label, type, value, placeholder, onChange) {
+  const row = document.createElement('div');
+  row.className = 'field-row';
+  const lbl = document.createElement('label');
+  lbl.textContent = label;
+  const inp = document.createElement('input');
+  inp.type = type; inp.value = value; inp.placeholder = placeholder;
+  inp.oninput = e => onChange(e.target.value);
+  row.appendChild(lbl); row.appendChild(inp);
+  return row;
+}
+
+function buildDependsOn(node, myIdx) {
+  const sec = document.createElement('div');
+  sec.className = 'depends-section';
+  const lbl = document.createElement('label');
+  lbl.textContent = 'Depends On';
+  sec.appendChild(lbl);
+
+  const chipRow = document.createElement('div');
+  chipRow.className = 'chip-row';
+
+  function redrawChips() {
+    chipRow.innerHTML = '';
+    (node.depends_on || []).forEach(dep => {
+      const chip = document.createElement('div');
+      chip.className = 'dep-chip';
+      chip.innerHTML = `<span>${dep}</span><button title="Remove">×</button>`;
+      chip.querySelector('button').onclick = () => {
+        node.depends_on = node.depends_on.filter(d => d !== dep);
+        redrawChips();
+      };
+      chipRow.appendChild(chip);
+    });
+  }
+
+  redrawChips();
+  sec.appendChild(chipRow);
+
+  // add-dep row
+  const addRow = document.createElement('div');
+  addRow.className = 'add-dep-row';
+  const depSel = document.createElement('select');
+
+  function populateDepSel() {
+    depSel.innerHTML = '<option value="">+ add dependency…</option>';
+    nodes.forEach((n, i) => {
+      if (i !== myIdx && n.id && !(node.depends_on || []).includes(n.id)) {
+        const opt = document.createElement('option');
+        opt.value = n.id; opt.textContent = n.id;
+        depSel.appendChild(opt);
+      }
+    });
+  }
+  populateDepSel();
+  depSel.onfocus = populateDepSel;
+
+  depSel.onchange = e => {
+    const v = e.target.value;
+    if (!v) return;
+    if (!node.depends_on) node.depends_on = [];
+    if (!node.depends_on.includes(v)) {
+      node.depends_on.push(v);
+      redrawChips();
+    }
+    depSel.value = '';
+  };
+
+  addRow.appendChild(depSel);
+  sec.appendChild(addRow);
+  return sec;
+}
+
+function refreshDepChips() {
+  // Re-render without losing scroll position — cheapest approach
+  const y = document.getElementById('canvas').scrollTop;
+  renderCanvas();
+  document.getElementById('canvas').scrollTop = y;
+}
+
+function buildInputs(node) {
+  const sec = document.createElement('div');
+  sec.className = 'inputs-section';
+  const lbl = document.createElement('label');
+  lbl.textContent = 'Inputs';
+  sec.appendChild(lbl);
+
+  function redrawInputs() {
+    // remove old rows
+    [...sec.querySelectorAll('.input-row')].forEach(r => r.remove());
+    [...sec.querySelectorAll('.add-input-btn')].forEach(r => r.remove());
+
+    node.inputs.forEach((inp, i) => {
+      const row = document.createElement('div');
+      row.className = 'input-row';
+      row.innerHTML = `
+        <input class="key" type="text" placeholder="key" value="${escHtml(inp.key)}" />
+        <span class="input-sep">=</span>
+        <input type="text" placeholder='value or "${'{'}fetch.output.data{"}"}"' value="${escHtml(inp.value)}" />
+        <button class="btn-icon" title="Remove">×</button>`;
+      row.querySelectorAll('input')[0].oninput = e => { inp.key = e.target.value; };
+      row.querySelectorAll('input')[1].oninput = e => { inp.value = e.target.value; };
+      row.querySelector('button').onclick = () => { node.inputs.splice(i, 1); redrawInputs(); };
+      sec.insertBefore(row, addBtn);
+    });
+  }
+
+  const addBtn = document.createElement('button');
+  addBtn.className = 'add-input-btn';
+  addBtn.textContent = '+ Add Input';
+  addBtn.onclick = () => { node.inputs.push({ key: '', value: '' }); redrawInputs(); };
+  sec.appendChild(addBtn);
+
+  redrawInputs();
+  return sec;
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ── Add node ───────────────────────────────────────────────────────────────
+function addNode() {
+  nodes.push({ id: '', component: components[0] || '', depends_on: [], inputs: [] });
+  renderCanvas();
+  // scroll to bottom
+  const canvas = document.getElementById('canvas');
+  canvas.scrollTop = canvas.scrollHeight;
+}
+
+// ── Save ───────────────────────────────────────────────────────────────────
+async function savePipeline() {
+  const name = currentRuntime;
+  if (!name) return;
+
+  // build payload
+  const payload = {
+    nodes: nodes.map(n => {
+      const obj = { id: n.id, component: n.component };
+      if (n.depends_on && n.depends_on.length) obj.depends_on = n.depends_on;
+      if (n.inputs && n.inputs.length) {
+        obj.inputs = {};
+        n.inputs.forEach(i => { if (i.key) obj.inputs[i.key] = i.value; });
+      }
+      return obj;
+    })
+  };
+
+  const { ok, data } = await apiFetch(`/v2/pipelines/${name}/config`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+
+  if (ok) {
+    toast(`"${name}" saved — ${data.node_count} node${data.node_count !== 1 ? 's' : ''}`, 'success');
+  } else {
+    toast(data.detail || 'Save failed', 'error');
+  }
+}
+
+// ── Delete ─────────────────────────────────────────────────────────────────
+async function deletePipeline() {
+  if (!currentRuntime) return;
+  if (!confirm(`Delete pipeline "${currentRuntime}"? This cannot be undone.`)) return;
+
+  const { ok } = await apiFetch(`/v2/pipelines/${currentRuntime}/config`, { method: 'DELETE' });
+  if (ok) {
+    toast(`"${currentRuntime}" deleted`);
+    currentRuntime = null;
+    nodes = [];
+    document.getElementById('pipeline-name').value = '';
+    document.getElementById('save-btn').style.display   = 'none';
+    document.getElementById('delete-btn').style.display = 'none';
+    document.getElementById('run-btn').style.display    = 'none';
+    document.getElementById('canvas').innerHTML = `
+      <div id="empty-state" style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#475569;gap:10px">
+        <p>Select a pipeline or create a new one</p></div>`;
+    refreshSidebar();
+  } else {
+    toast('Delete failed', 'error');
+  }
+}
+
+// ── Run pipeline ───────────────────────────────────────────────────────────
+async function runPipeline() {
+  if (!currentRuntime) return;
+  toast(`Running "${currentRuntime}"…`, 'success');
+  const { ok, data } = await apiFetch(`/v2/pipelines/${currentRuntime}/run`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ source: 'sample' }),
+  });
+  if (ok && data.succeeded) {
+    toast(`✓ Succeeded — ${data.nodes.length} nodes, ${data.lros.length} LROs`);
+  } else {
+    const failed = (data.nodes || []).filter(n => n.status === 'failed').map(n => n.node_id).join(', ');
+    toast(`✗ Failed: ${failed || data.detail || 'unknown error'}`, 'error');
+  }
+}
+
+// ── New pipeline modal ─────────────────────────────────────────────────────
+document.getElementById('new-btn').onclick = () => {
+  document.getElementById('modal-name').value = '';
+  document.getElementById('modal-overlay').classList.add('open');
+  document.getElementById('modal-name').focus();
+};
+document.getElementById('modal-cancel').onclick = () =>
+  document.getElementById('modal-overlay').classList.remove('open');
+
+document.getElementById('modal-create').onclick = async () => {
+  const name = document.getElementById('modal-name').value.trim();
+  if (!/^[a-z][a-z0-9_]*$/.test(name)) {
+    toast('Name must be lowercase letters, digits, underscores', 'error'); return;
+  }
+  // create a minimal pipeline then open it
+  const { ok, data } = await apiFetch(`/v2/pipelines/${name}/config`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ nodes: [{ id: 'node_1', component: components[0] || '' }] }),
+  });
+  document.getElementById('modal-overlay').classList.remove('open');
+  if (ok) {
+    await refreshSidebar();
+    loadPipeline(name);
+  } else {
+    toast(data.detail || 'Could not create pipeline', 'error');
+  }
+};
+
+document.getElementById('modal-name').addEventListener('keydown', e => {
+  if (e.key === 'Enter') document.getElementById('modal-create').click();
+  if (e.key === 'Escape') document.getElementById('modal-cancel').click();
+});
+
+// ── Wire toolbar buttons ───────────────────────────────────────────────────
+document.getElementById('save-btn').onclick   = savePipeline;
+document.getElementById('delete-btn').onclick = deletePipeline;
+document.getElementById('run-btn').onclick    = runPipeline;
+
+// ── Tab switching ──────────────────────────────────────────────────────────
+function switchTab(tab) {
+  document.querySelectorAll('.tab-btn').forEach((b, i) => {
+    b.classList.toggle('active', ['pipelines','components'][i] === tab);
+  });
+  document.getElementById('tab-pipelines').style.display  = tab === 'pipelines'  ? 'flex' : 'none';
+  document.getElementById('tab-components').style.display = tab === 'components' ? 'flex' : 'none';
+  if (tab === 'components') loadComponentList();
+}
+
+// ── Component list ─────────────────────────────────────────────────────────
+let allComponentInfo = { components: [], user: [], plugins: [] };
+
+async function loadComponentList() {
+  const { data } = await apiFetch('/v2/components');
+  allComponentInfo = data;
+  const list = document.getElementById('component-list');
+  list.innerHTML = '';
+  const plugins = data.plugins || [];
+  if (plugins.length === 0) {
+    list.innerHTML = `<div style="padding:20px;color:#475569;font-size:13px;text-align:center">No components yet.<br>Click "+ New Component" to add one.</div>`;
+    return;
+  }
+  for (const name of plugins) {
+    const el = document.createElement('div');
+    el.className = 'component-item';
+    el.innerHTML = `<span style="flex:1">${name}</span><span class="comp-badge badge-plugin">plugin</span>`;
+    el.onclick = () => openComponentEditor(name);
+    list.appendChild(el);
+  }
+}
+
+// ── Component editor ───────────────────────────────────────────────────────
+let _editingComponent = null;  // null = new, string = existing plugin name
+
+async function openComponentEditor(name = null) {
+  _editingComponent = name;
+  document.getElementById('comp-modal-title').textContent = name ? `Edit: ${name}` : 'New Component';
+  document.getElementById('comp-name').value = name || '';
+  document.getElementById('comp-name').readOnly = !!name;
+  document.getElementById('comp-delete-btn').style.display = name ? '' : 'none';
+
+  if (name) {
+    const { ok, data } = await apiFetch(`/v2/components/${name}/source`);
+    document.getElementById('comp-source').value = ok ? data.source : '# could not load source';
+  } else {
+    // Load the skeleton, using the current name input or a default
+    const skel = await apiFetch('/v2/components/skeleton?name=my_component');
+    document.getElementById('comp-source').value = skel.data.source || '';
+  }
+
+  document.getElementById('comp-modal-overlay').classList.add('open');
+  if (!name) document.getElementById('comp-name').focus();
+}
+
+async function updateSkeletonForName() {
+  const nameEl = document.getElementById('comp-name');
+  const name = nameEl.value.trim();
+  if (_editingComponent || !name || !/^[a-z][a-z0-9_]*$/.test(name)) return;
+  const { ok, data } = await apiFetch(`/v2/components/skeleton?name=${encodeURIComponent(name)}`);
+  if (ok) document.getElementById('comp-source').value = data.source;
+}
+
+document.getElementById('comp-name').addEventListener('blur', updateSkeletonForName);
+
+async function saveComponent() {
+  const name   = document.getElementById('comp-name').value.trim();
+  const source = document.getElementById('comp-source').value;
+  if (!name) { toast('Component name is required', 'error'); return; }
+
+  const { ok, data } = await apiFetch('/v2/components', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, source }),
+  });
+
+  if (ok) {
+    toast(`"${name}" registered`, 'success');
+    document.getElementById('comp-modal-overlay').classList.remove('open');
+    loadComponentList();
+    // Refresh the components dropdown list used in pipeline editor
+    await refreshComponents();
+  } else {
+    toast(data.detail || 'Save failed', 'error');
+  }
+}
+
+async function deleteComponent() {
+  const name = _editingComponent;
+  if (!name) return;
+  if (!confirm(`Delete component "${name}"? The pipeline YAML entries using it will stop working.`)) return;
+
+  const { ok, data } = await apiFetch(`/v2/components/${name}`, { method: 'DELETE' });
+  if (ok) {
+    toast(`"${name}" deleted`);
+    document.getElementById('comp-modal-overlay').classList.remove('open');
+    loadComponentList();
+    await refreshComponents();
+  } else {
+    toast(data.detail || 'Delete failed', 'error');
+  }
+}
+
+async function refreshComponents() {
+  const { data } = await apiFetch('/v2/components');
+  allComponentInfo = data;
+  components = data.user || [];  // update the dropdown source
+  if (currentRuntime) renderCanvas();  // re-render dropdowns
+}
+
+document.getElementById('new-component-btn').onclick = () => openComponentEditor(null);
+document.getElementById('comp-save-btn').onclick     = saveComponent;
+document.getElementById('comp-delete-btn').onclick   = deleteComponent;
+document.getElementById('comp-modal-cancel').onclick = () =>
+  document.getElementById('comp-modal-overlay').classList.remove('open');
+
+// ── Start ──────────────────────────────────────────────────────────────────
+boot();
+</script>
+</body>
+</html>

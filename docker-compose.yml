@@ -1,0 +1,66 @@
+services:
+
+  # ---------------------------------------------------------------------------
+  # DataProvider microservice
+  # ---------------------------------------------------------------------------
+  genesys-data-provider:
+    build:
+      context: .
+      dockerfile: services/data_provider/Dockerfile
+    image: genesys-data-provider
+    container_name: genesys-data-provider
+    ports:
+      - "8001:8001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # LinearRegression model microservice (stateless — serializes weights on /fit)
+  # ---------------------------------------------------------------------------
+  genesys-linear-regression:
+    build:
+      context: .
+      dockerfile: services/linear_regression/Dockerfile
+    image: genesys-linear-regression
+    container_name: genesys-linear-regression
+    ports:
+      - "8002:8002"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # ComponentManager / API gateway — orchestrates the two services above
+  # ---------------------------------------------------------------------------
+  genesys-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: genesys-api
+    container_name: genesys-api
+    ports:
+      - "8000:8000"
+    environment:
+      DATA_PROVIDER_URL: "http://genesys-data-provider:8001"
+      LINEAR_REGRESSION_URL: "http://genesys-linear-regression:8002"
+    volumes:
+      # Mount data/ so SQLite writes survive container restarts
+      - ./data:/app/data
+    depends_on:
+      genesys-data-provider:
+        condition: service_healthy
+      genesys-linear-regression:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s

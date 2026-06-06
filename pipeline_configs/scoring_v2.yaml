@@ -1,0 +1,40 @@
+# scoring_v2 — fan-out demo.
+#
+# Same fetch as v1, but trains TWO models in parallel (train_a and train_b run
+# in the same level because neither depends on the other) and then persists
+# both. Use this runtime type to demo parallel execution.
+
+runtime_type: scoring_v2
+
+nodes:
+  - id: fetch
+    component: data_provider
+    inputs:
+      source: "${request.source}"
+
+  - id: train_a
+    component: linear_regression
+    depends_on: [fetch]
+    inputs:
+      data:    "${fetch.output.data}"
+      targets: "${fetch.output.targets}"
+      learning_rate: 0.01
+      epochs: 300
+
+  - id: train_b
+    component: linear_regression
+    depends_on: [fetch]
+    inputs:
+      data:    "${fetch.output.data}"
+      targets: "${fetch.output.targets}"
+      learning_rate: 0.05
+      epochs: 300
+
+  - id: persist
+    component: save_results
+    depends_on: [train_a, train_b]
+    wait_for_lros: true
+    inputs:
+      weights: "${train_a.output.weights}"
+      bias:    "${train_a.output.bias}"
+      label:   "scoring_v2"

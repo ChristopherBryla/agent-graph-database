@@ -1,0 +1,37 @@
+# scoring_v1 — basic linear scoring pipeline.
+#
+# Flow:
+#   fetch (data_provider)  →  train (linear_regression)  →  persist (save_results)
+#
+# Reference syntax inside `inputs:`
+#   ${request.<field>}     reads the JSON body of the POST
+#   ${<node_id>.output.x}  reads field `x` from the output of an upstream node
+#
+# `wait_for_lros: true` makes the orchestrator block on this node's
+# long-running operations BEFORE scheduling its dependents.
+
+runtime_type: scoring_v1
+
+nodes:
+  - id: fetch
+    component: data_provider
+    inputs:
+      source: "${request.source}"
+
+  - id: train
+    component: linear_regression
+    depends_on: [fetch]
+    inputs:
+      data:    "${fetch.output.data}"
+      targets: "${fetch.output.targets}"
+      learning_rate: 0.01
+      epochs: 500
+
+  - id: persist
+    component: save_results
+    depends_on: [train]
+    wait_for_lros: true
+    inputs:
+      weights: "${train.output.weights}"
+      bias:    "${train.output.bias}"
+      label:   "scoring_v1"

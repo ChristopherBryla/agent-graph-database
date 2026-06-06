@@ -1,0 +1,64 @@
+# scoring_production — no fetch node.
+#
+# The upstream ETL system is responsible for shaping data to this contract
+# and POSTing it to:
+#   POST /v2/pipelines/scoring_production/run
+#
+# The contract block is enforced before the pipeline runs — any violation
+# returns HTTP 422 with a list of what was wrong.
+#
+# The data_provider node acts as the internal data bus: it receives the
+# pre-shaped request data and makes it available to all downstream nodes.
+# When multiple models run in parallel they all draw from the same
+# data_provider output via ${distribute.output.*}.
+
+runtime_type: scoring_production
+
+contract:
+  - name: data
+    type: list
+    required: true
+    description: "List of dicts, each with keys matching the model input contract (x1, x2, x3, x4)"
+  - name: targets
+    type: list
+    required: true
+    description: "List of float target values, one per row in data"
+  - name: label
+    type: str
+    required: false
+    description: "Optional label to tag the saved result"
+
+nodes:
+  - id: distribute
+    component: data_provider
+    inputs:
+      source: "passthrough"
+      data: "${request.data}"
+      targets: "${request.targets}"
+
+  - id: train_a
+    component: linear_regression
+    depends_on: [distribute]
+    inputs:
+      data:          "${distribute.output.data}"
+      targets:       "${distribute.output.targets}"
+      learning_rate: 0.01
+      epochs:        500
+
+  - id: train_b
+    component: linear_regression
+    depends_on: [distribute]
+    inputs:
+      data:          "${distribute.output.data}"
+      targets:       "${distribute.output.targets}"
+      learning_rate: 0.05
+      epochs:        500
+
+  - id: persist
+    component: save_results
+    depends_on: [train_a, train_b]
+    wait_for_lros: true
+    inputs:
+      weights: "${train_a.output.weights}"
+      bias:    "${train_a.output.bias}"
+      label:   "${request.label}"

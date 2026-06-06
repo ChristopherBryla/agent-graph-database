@@ -1,0 +1,8 @@
+runtime_type: the2
+nodes:
+- id: prep
+  component: linear_regression
+- id: tte
+  component: test_1
+  depends_on:
+  - node_1
