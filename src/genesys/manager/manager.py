@@ -2,7 +2,9 @@
 
 Responsibilities:
   1. Load a per-runtime-type pipeline YAML (one file per runtime).
-  2. Build the dependency graph and group nodes into parallel-safe levels.
+  2. Build the dependency graph and schedule nodes with a ready-set scheduler:
+     a node is submitted to the thread pool the moment ALL of its dependencies
+     have finished — it never waits for unrelated nodes.
   3. Resolve every node's `inputs:` block by interpolating ${...} references
      against a shared run_context (request body + completed node outputs).
   4. Apply caller-supplied overrides:
@@ -21,9 +23,11 @@ must implement:
 
 from __future__ import annotations
 
+import math
+import re
 import threading
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -33,9 +37,39 @@ import yaml
 from genesys.manager.lro import LROCollector
 
 
+# Run classification. `run_type` is a free-form label so teams can define
+# their own (e.g. "team_a_check", "chris_experiment") — but with two rules:
+#   1. Format is enforced (lowercase slug) so labels stay queryable and a
+#      stray space/typo can't create unfilterable values downstream.
+#   2. "production" is the single reserved label business consumers treat as
+#      customer-grade/verified. It is never a default — always an explicit
+#      assertion. Everything else is non-production by definition.
+RUN_TYPE_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+PRODUCTION_RUN_TYPE = "production"
+DEFAULT_RUN_TYPE = "test"
+
+
 # ---------------------------------------------------------------------------
 # Result types
 # ---------------------------------------------------------------------------
+
+def _json_safe(value: Any) -> Any:
+    """Snapshot *value* into a JSON-safe structure for recording.
+
+    Resolved inputs may carry raw upstream data (NaN floats, arbitrary
+    objects). Recorded runs must serialize cleanly, so NaN/Inf become None
+    and unknown objects become their repr.
+    """
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    return repr(value)
+
 
 @dataclass
 class NodeOutcome:
@@ -45,6 +79,9 @@ class NodeOutcome:
     output: dict[str, Any] | None = None
     message: str = ""
     traceback: str | None = None
+    # Resolved inputs (after ${...} interpolation). Recorded so a stored run
+    # can later be replayed node-by-node without re-running upstream nodes.
+    inputs: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d = {
@@ -53,6 +90,7 @@ class NodeOutcome:
             "status": self.status,
             "output": self.output,
             "message": self.message,
+            "inputs": self.inputs,
         }
         if self.traceback is not None:
             d["traceback"] = self.traceback
@@ -63,12 +101,14 @@ class NodeOutcome:
 class RunResult:
     runtime_type: str
     succeeded: bool
+    run_type: str = DEFAULT_RUN_TYPE
     nodes: list[NodeOutcome] = field(default_factory=list)
     lros: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "runtime_type": self.runtime_type,
+            "run_type": self.run_type,
             "succeeded": self.succeeded,
             "nodes": [n.to_dict() for n in self.nodes],
             "lros": self.lros,
@@ -84,6 +124,70 @@ class ContractValidationError(Exception):
     def __init__(self, violations: list[str]) -> None:
         self.violations = violations
         super().__init__("request body failed contract validation: " + "; ".join(violations))
+
+
+def validate_pipeline_config(
+    config: dict[str, Any],
+    registered_components: set[str] | None = None,
+) -> list[str]:
+    """Statically validate a pipeline config dict. Returns a list of problems
+    (empty = valid).
+
+    Checks: node shape, duplicate ids, dependency graph (cycles / unknown
+    deps), component existence (when *registered_components* is given), and
+    the contract block shape. Used at save time so a data scientist gets
+    instant feedback instead of a runtime failure.
+    """
+    problems: list[str] = []
+
+    nodes = config.get("nodes")
+    if not isinstance(nodes, list) or not nodes:
+        return ["'nodes' must be a non-empty list"]
+
+    seen_ids: set[str] = set()
+    for i, node in enumerate(nodes):
+        if not isinstance(node, dict):
+            problems.append(f"node[{i}] must be an object")
+            continue
+        node_id = node.get("id")
+        if not node_id or not isinstance(node_id, str):
+            problems.append(f"node[{i}] must have a string 'id'")
+            continue
+        if node_id in seen_ids:
+            problems.append(f"duplicate node id '{node_id}'")
+        seen_ids.add(node_id)
+
+        component = node.get("component")
+        if not component or not isinstance(component, str):
+            problems.append(f"node '{node_id}' must have a string 'component'")
+        elif registered_components is not None and component not in registered_components:
+            problems.append(
+                f"node '{node_id}' uses unknown component '{component}' "
+                f"(registered: {sorted(registered_components)})"
+            )
+
+        if "inputs" in node and node["inputs"] is not None and not isinstance(node["inputs"], dict):
+            problems.append(f"node '{node_id}': 'inputs' must be a mapping")
+        if "depends_on" in node and not isinstance(node["depends_on"], list):
+            problems.append(f"node '{node_id}': 'depends_on' must be a list")
+
+    if not problems:
+        deps = {n["id"]: n.get("depends_on", []) or [] for n in nodes}
+        try:
+            _validate_graph(deps)
+        except ValueError as exc:
+            problems.append(str(exc))
+
+    contract = config.get("contract")
+    if contract is not None:
+        if not isinstance(contract, list):
+            problems.append("'contract' must be a list of field definitions")
+        else:
+            for i, field_def in enumerate(contract):
+                if not isinstance(field_def, dict) or not field_def.get("name"):
+                    problems.append(f"contract[{i}] must be an object with a 'name'")
+
+    return problems
 
 
 def _validate_contract(contract_cfg: list[dict], payload: dict[str, Any]) -> list[str]:
@@ -187,12 +291,16 @@ class RunOptions:
     debug_components: set[str] | None = None  # None = run everything
     fail_fast: bool = False
     trace_failures: bool = False
+    run_type: str = DEFAULT_RUN_TYPE  # one of RUN_TYPES; see module docstring
 
 
 class Manager:
-    def __init__(self, config_dir: str | Path) -> None:
+    def __init__(self, config_dir: str | Path, max_workers: int = 8) -> None:
         self._config_dir = Path(config_dir)
         self._registry: dict[str, Any] = {}
+        # Upper bound on threads per level — prevents a wide fan-out (e.g. a
+        # 50-node level) from spawning 50 threads at once.
+        self._max_workers = max(1, max_workers)
 
     # ------------------------------------------------------------------
     # Registry
@@ -225,6 +333,18 @@ class Manager:
             "contract": config.get("contract", []),
         }
 
+    def validate_request(self, runtime_type: str, payload: dict[str, Any]) -> list[str]:
+        """Validate *payload* against the pipeline's contract without running it.
+
+        Returns a list of violations (empty = valid). Raises FileNotFoundError
+        if the runtime_type has no config. Used to reject bad async runs
+        before a run record is created.
+        """
+        contract_cfg = self.get_contract(runtime_type)["contract"]
+        if not contract_cfg:
+            return []
+        return _validate_contract(contract_cfg, payload)
+
     # ------------------------------------------------------------------
     # Execution
     # ------------------------------------------------------------------
@@ -236,6 +356,11 @@ class Manager:
         options: RunOptions | None = None,
     ) -> RunResult:
         options = options or RunOptions()
+        if not RUN_TYPE_RE.match(options.run_type):
+            raise ValueError(
+                f"invalid run_type '{options.run_type}' — must be a lowercase slug "
+                "(letters, digits, '_', '-'; starting with a letter; max 64 chars)"
+            )
 
         config_path = self._config_dir / f"{runtime_type}.yaml"
         if not config_path.exists():
@@ -256,121 +381,149 @@ class Manager:
 
         nodes_cfg = config.get("nodes", [])
         if not nodes_cfg:
-            return RunResult(runtime_type=runtime_type, succeeded=True)
+            return RunResult(runtime_type=runtime_type, succeeded=True, run_type=options.run_type)
 
         nodes_by_id: dict[str, dict] = {n["id"]: n for n in nodes_cfg}
         deps: dict[str, list[str]] = {n["id"]: n.get("depends_on", []) for n in nodes_cfg}
-        levels = _build_levels(deps)
+        _validate_graph(deps)
+
+        # Reverse edges + pending-dependency counts for ready-set scheduling.
+        dependents: dict[str, list[str]] = {nid: [] for nid in deps}
+        for nid, dep_list in deps.items():
+            for dep in dep_list:
+                dependents[dep].append(nid)
+        pending_deps: dict[str, int] = {nid: len(dep_list) for nid, dep_list in deps.items()}
 
         lro = LROCollector()
-        run_context: dict[str, Any] = {"request": request_payload}
+        # "run" exposes run-level metadata to pipelines: ${run.run_type} lets a
+        # node (e.g. save_results) tag persisted data with its classification.
+        run_context: dict[str, Any] = {
+            "request": request_payload,
+            "run": {"run_type": options.run_type},
+        }
         outcomes: dict[str, NodeOutcome] = {}
         ctx_lock = threading.Lock()
         any_failure = threading.Event()
 
-        for level_index, level in enumerate(levels):
-            if any_failure.is_set() and options.fail_fast:
-                # Mark remaining nodes as skipped due to fail-fast
-                for nid in level:
-                    cfg_node = nodes_by_id[nid]
-                    outcomes[nid] = NodeOutcome(
-                        node_id=nid,
-                        component=cfg_node["component"],
-                        status="skipped",
-                        message="fail-fast: an earlier node failed",
-                    )
-                continue
+        def execute_one(node_id: str) -> NodeOutcome:
+            cfg_node = nodes_by_id[node_id]
+            component_name = cfg_node["component"]
 
-            print(f"[manager] level {level_index}: {level}")
+            # Debug filter
+            if options.debug_components is not None and component_name not in options.debug_components:
+                return NodeOutcome(
+                    node_id=node_id,
+                    component=component_name,
+                    status="skipped",
+                    message="not in X-Debug-Component-List",
+                )
 
-            def execute_one(node_id: str) -> NodeOutcome:
-                cfg_node = nodes_by_id[node_id]
-                component_name = cfg_node["component"]
+            component = self._registry.get(component_name)
+            if component is None:
+                return NodeOutcome(
+                    node_id=node_id,
+                    component=component_name,
+                    status="skipped",
+                    message=f"component '{component_name}' not registered",
+                )
 
-                # Debug filter
-                if options.debug_components is not None and component_name not in options.debug_components:
-                    return NodeOutcome(
-                        node_id=node_id,
-                        component=component_name,
-                        status="skipped",
-                        message="not in X-Debug-Component-List",
-                    )
+            # Resolve inputs against the shared context
+            with ctx_lock:
+                snapshot_ctx = dict(run_context)
+            try:
+                raw_inputs = cfg_node.get("inputs", {}) or {}
+                inputs = resolve_value(raw_inputs, snapshot_ctx)
+            except ReferenceError as exc:
+                return NodeOutcome(
+                    node_id=node_id,
+                    component=component_name,
+                    status="failed",
+                    message=str(exc),
+                    traceback=traceback.format_exc() if options.trace_failures else None,
+                )
 
-                component = self._registry.get(component_name)
-                if component is None:
-                    return NodeOutcome(
-                        node_id=node_id,
-                        component=component_name,
-                        status="skipped",
-                        message=f"component '{component_name}' not registered",
+            # Execute
+            try:
+                output = component.execute(
+                    lro_collector=lro,
+                    node_id=node_id,
+                    **inputs,
+                )
+                if output is not None and not isinstance(output, dict):
+                    raise TypeError(
+                        f"component '{component_name}' returned {type(output).__name__}; "
+                        "execute() must return a dict (or None)"
                     )
+                outcome = NodeOutcome(
+                    node_id=node_id,
+                    component=component_name,
+                    status="completed",
+                    output=output or {},
+                    inputs=_json_safe(inputs),
+                )
+            except Exception as exc:
+                return NodeOutcome(
+                    node_id=node_id,
+                    component=component_name,
+                    status="failed",
+                    message=f"{type(exc).__name__}: {exc}",
+                    traceback=traceback.format_exc() if options.trace_failures else None,
+                    inputs=inputs,
+                )
 
-                # Resolve inputs against the shared context
-                with ctx_lock:
-                    snapshot_ctx = dict(run_context)
-                try:
-                    raw_inputs = cfg_node.get("inputs", {}) or {}
-                    inputs = resolve_value(raw_inputs, snapshot_ctx)
-                except ReferenceError as exc:
-                    return NodeOutcome(
-                        node_id=node_id,
-                        component=component_name,
-                        status="failed",
-                        message=str(exc),
-                        traceback=traceback.format_exc() if options.trace_failures else None,
+            # Honor wait_for_lros inside the worker: the node only counts as
+            # finished (and its dependents only become ready) once all of its
+            # long-running operations reach a terminal state.
+            if cfg_node.get("wait_for_lros"):
+                ok, failed_ops = lro.wait_for_node(node_id)
+                if not ok:
+                    outcome.status = "failed"
+                    outcome.message = (
+                        f"wait_for_lros: {len(failed_ops)} operation(s) did not complete: {failed_ops}"
                     )
+            return outcome
 
-                # Execute
-                try:
-                    output = component.execute(
-                        lro_collector=lro,
-                        node_id=node_id,
-                        **inputs,
-                    )
-                    if output is not None and not isinstance(output, dict):
-                        raise TypeError(
-                            f"component '{component_name}' returned {type(output).__name__}; "
-                            "execute() must return a dict (or None)"
-                        )
-                    return NodeOutcome(
-                        node_id=node_id,
-                        component=component_name,
-                        status="completed",
-                        output=output or {},
-                    )
-                except Exception as exc:
-                    return NodeOutcome(
-                        node_id=node_id,
-                        component=component_name,
-                        status="failed",
-                        message=f"{type(exc).__name__}: {exc}",
-                        traceback=traceback.format_exc() if options.trace_failures else None,
-                    )
+        # Ready-set scheduler: submit a node as soon as ALL its dependencies
+        # have finished. A slow node only delays its own dependents — unrelated
+        # branches keep flowing through the (capped) thread pool.
+        with ThreadPoolExecutor(max_workers=self._max_workers) as pool:
+            in_flight: dict[Future[NodeOutcome], str] = {}
 
-            # Run this level in parallel
-            with ThreadPoolExecutor(max_workers=max(len(level), 1)) as pool:
-                futures = {pool.submit(execute_one, nid): nid for nid in level}
-                for fut in as_completed(futures):
+            def submit(node_id: str) -> None:
+                print(f"[manager] scheduling node '{node_id}'")
+                in_flight[pool.submit(execute_one, node_id)] = node_id
+
+            for nid, count in pending_deps.items():
+                if count == 0:
+                    submit(nid)
+
+            while in_flight:
+                done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    finished_id = in_flight.pop(fut)
                     outcome = fut.result()
-                    outcomes[outcome.node_id] = outcome
+                    outcomes[finished_id] = outcome
                     with ctx_lock:
-                        run_context[outcome.node_id] = {"output": outcome.output or {}}
+                        run_context[finished_id] = {"output": outcome.output or {}}
                     if outcome.status == "failed":
                         any_failure.set()
 
-            # After the level finishes, honor wait_for_lros for any node in it
-            for nid in level:
-                if not nodes_by_id[nid].get("wait_for_lros"):
-                    continue
-                if outcomes[nid].status != "completed":
-                    continue
-                ok, failed_ops = lro.wait_for_node(nid)
-                if not ok:
-                    outcomes[nid].status = "failed"
-                    outcomes[nid].message = (
-                        f"wait_for_lros: {len(failed_ops)} operation(s) did not complete: {failed_ops}"
-                    )
-                    any_failure.set()
+                    for child in dependents[finished_id]:
+                        pending_deps[child] -= 1
+                        if pending_deps[child] == 0:
+                            if any_failure.is_set() and options.fail_fast:
+                                continue  # marked skipped below
+                            submit(child)
+
+        # Any node never scheduled (fail-fast cut its branch off) is skipped.
+        for nid in deps:
+            if nid not in outcomes:
+                outcomes[nid] = NodeOutcome(
+                    node_id=nid,
+                    component=nodes_by_id[nid]["component"],
+                    status="skipped",
+                    message="fail-fast: an earlier node failed",
+                )
 
         # Build final result preserving config order for readability
         ordered = [outcomes[n["id"]] for n in nodes_cfg if n["id"] in outcomes]
@@ -378,39 +531,31 @@ class Manager:
         return RunResult(
             runtime_type=runtime_type,
             succeeded=succeeded,
+            run_type=options.run_type,
             nodes=ordered,
             lros=lro.snapshot(),
         )
 
 
 # ---------------------------------------------------------------------------
-# Topological level grouping (same algorithm as the v1 manager)
+# Graph validation (cycles + unknown dependencies)
 # ---------------------------------------------------------------------------
 
-def _build_levels(deps: dict[str, list[str]]) -> list[list[str]]:
-    node_level: dict[str, int] = {}
+def _validate_graph(deps: dict[str, list[str]]) -> None:
+    """Raise ValueError on circular dependencies or references to unknown nodes."""
+    visited: set[str] = set()
 
-    def get_level(node_id: str, visiting: set[str]) -> int:
-        if node_id in node_level:
-            return node_level[node_id]
+    def visit(node_id: str, visiting: set[str]) -> None:
+        if node_id in visited:
+            return
         if node_id in visiting:
             raise ValueError(f"circular dependency at node '{node_id}'")
         visiting = visiting | {node_id}
-        lvl = 0
         for dep in deps.get(node_id, []):
             if dep not in deps:
                 raise ValueError(f"node '{node_id}' depends on unknown node '{dep}'")
-            lvl = max(lvl, get_level(dep, visiting) + 1)
-        node_level[node_id] = lvl
-        return lvl
+            visit(dep, visiting)
+        visited.add(node_id)
 
     for nid in deps:
-        get_level(nid, set())
-
-    if not node_level:
-        return []
-    max_lvl = max(node_level.values())
-    levels: list[list[str]] = [[] for _ in range(max_lvl + 1)]
-    for nid, lvl in node_level.items():
-        levels[lvl].append(nid)
-    return levels
+        visit(nid, set())
