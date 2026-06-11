@@ -65,6 +65,7 @@ class RunStore:
                     run_id       TEXT PRIMARY KEY,
                     runtime_type TEXT NOT NULL,
                     run_type     TEXT NOT NULL,
+                    parent_run_id TEXT,
                     status       TEXT NOT NULL,   -- running | completed | error
                     succeeded    INTEGER,         -- NULL while running
                     request      TEXT NOT NULL,   -- JSON request payload
@@ -81,6 +82,7 @@ class RunStore:
                     component   TEXT NOT NULL,
                     status      TEXT NOT NULL,
                     message     TEXT,
+                    inputs_lossy INTEGER NOT NULL DEFAULT 0,
                     inputs      TEXT,             -- JSON resolved inputs
                     output      TEXT,             -- JSON node output
                     recorded_at TEXT NOT NULL
@@ -88,9 +90,18 @@ class RunStore:
 
                 CREATE INDEX IF NOT EXISTS idx_runs_runtime  ON runs(runtime_type);
                 CREATE INDEX IF NOT EXISTS idx_runs_run_type ON runs(run_type);
+                CREATE INDEX IF NOT EXISTS idx_runs_parent   ON runs(parent_run_id);
                 CREATE INDEX IF NOT EXISTS idx_runs_started  ON runs(started_at);
                 CREATE INDEX IF NOT EXISTS idx_run_nodes_run ON run_nodes(run_id);
             """)
+            self._ensure_column(conn, "runs", "parent_run_id", "TEXT")
+            self._ensure_column(conn, "run_nodes", "inputs_lossy", "INTEGER NOT NULL DEFAULT 0")
+
+    @staticmethod
+    def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
     # ------------------------------------------------------------------
     # Writes
@@ -102,13 +113,14 @@ class RunStore:
         runtime_type: str,
         run_type: str,
         request_payload: dict[str, Any],
+        parent_run_id: str | None = None,
     ) -> None:
         """Record a new run in 'running' state."""
         with self._lock, self._connect() as conn:
             conn.execute(
-                "INSERT INTO runs (run_id, runtime_type, run_type, status, request, started_at) "
-                "VALUES (?, ?, ?, 'running', ?, ?)",
-                (run_id, runtime_type, run_type, json.dumps(request_payload), _now()),
+                "INSERT INTO runs (run_id, runtime_type, run_type, parent_run_id, status, request, started_at) "
+                "VALUES (?, ?, ?, ?, 'running', ?, ?)",
+                (run_id, runtime_type, run_type, parent_run_id, json.dumps(request_payload), _now()),
             )
 
     def complete_run(self, run_id: str, result: dict[str, Any]) -> None:
@@ -131,8 +143,8 @@ class RunStore:
             for node in result.get("nodes", []):
                 conn.execute(
                     "INSERT INTO run_nodes "
-                    "(id, run_id, node_id, component, status, message, inputs, output, recorded_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "(id, run_id, node_id, component, status, message, inputs_lossy, inputs, output, recorded_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         str(uuid.uuid4()),
                         run_id,
@@ -140,6 +152,7 @@ class RunStore:
                         node.get("component", ""),
                         node.get("status", ""),
                         node.get("message", ""),
+                        1 if node.get("inputs_lossy") else 0,
                         json.dumps(node.get("inputs")),
                         json.dumps(node.get("output")),
                         now,
@@ -180,6 +193,7 @@ class RunStore:
                 "component": n["component"],
                 "status": n["status"],
                 "message": n["message"],
+                "inputs_lossy": bool(n["inputs_lossy"]),
                 "inputs": json.loads(n["inputs"]) if n["inputs"] else None,
                 "output": json.loads(n["output"]) if n["output"] else None,
             }
@@ -222,6 +236,7 @@ class RunStore:
             "run_id": row["run_id"],
             "runtime_type": row["runtime_type"],
             "run_type": row["run_type"],
+            "parent_run_id": row["parent_run_id"],
             "status": row["status"],
             "succeeded": None if row["succeeded"] is None else bool(row["succeeded"]),
             "started_at": row["started_at"],

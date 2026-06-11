@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
+import logging
 import os
 import re
 import secrets
@@ -27,9 +28,14 @@ from genesys.manager.manager import (
     ContractValidationError,
     Manager,
     RunOptions,
+    json_safe,
     validate_pipeline_config,
 )
 from genesys.storage.run_store import RunStore
+
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 # Directory holding one YAML per runtime_type.
 # Override with PIPELINE_CONFIGS_DIR env var (useful in tests or Docker).
@@ -102,7 +108,7 @@ def _load_plugins(orch: Manager) -> list[str]:
                     loaded.append(name)
                     break
         except Exception as exc:
-            print(f"[plugins] failed to load {py_file.name}: {exc}")
+            logger.warning(f"[plugins] failed to load {py_file.name}: {exc}")
     return loaded
 
 
@@ -178,9 +184,9 @@ async def lifespan(app: FastAPI):
     state.manager = orch
     state.save_results_adapter = save_adapter
     state.run_store = RunStore(db_path=RUNS_DB_PATH)
-    print(f"[startup] manager runtimes: {orch.list_runtime_types()}")
+    logger.info(f"[startup] manager runtimes: {orch.list_runtime_types()}")
     if plugins:
-        print(f"[startup] plugins loaded: {plugins}")
+        logger.info(f"[startup] plugins loaded: {plugins}")
     yield
 
 
@@ -361,6 +367,125 @@ def get_run(run_id: str) -> dict[str, Any]:
     if record is None:
         raise HTTPException(status_code=404, detail=f"no run with id '{run_id}'")
     return record
+
+
+def _json_path(base: str, key: str | int) -> str:
+    if isinstance(key, int):
+        return f"{base}[{key}]"
+    return f"{base}.{key}" if base else key
+
+
+def _structural_diff(old: Any, new: Any, base: str = "$") -> dict[str, Any]:
+    """Compute dependency-free structural diff keyed by JSONPath-like strings."""
+    added: dict[str, Any] = {}
+    removed: dict[str, Any] = {}
+    changed: dict[str, Any] = {}
+
+    def walk(left: Any, right: Any, path: str) -> None:
+        if isinstance(left, dict) and isinstance(right, dict):
+            left_keys = set(left.keys())
+            right_keys = set(right.keys())
+            for key in sorted(right_keys - left_keys):
+                added[_json_path(path, key)] = right[key]
+            for key in sorted(left_keys - right_keys):
+                removed[_json_path(path, key)] = left[key]
+            for key in sorted(left_keys & right_keys):
+                walk(left[key], right[key], _json_path(path, key))
+            return
+
+        if isinstance(left, list) and isinstance(right, list):
+            common = min(len(left), len(right))
+            for idx in range(common):
+                walk(left[idx], right[idx], _json_path(path, idx))
+            for idx in range(common, len(right)):
+                added[_json_path(path, idx)] = right[idx]
+            for idx in range(common, len(left)):
+                removed[_json_path(path, idx)] = left[idx]
+            return
+
+        if left != right:
+            changed[path] = {"before": left, "after": right}
+
+    walk(old, new, base)
+    return {"added": added, "removed": removed, "changed": changed}
+
+
+@app.post("/v2/runs/{run_id}/replay/{node_id}")
+def replay_node(run_id: str, node_id: str) -> dict[str, Any]:
+    """Replay one node using recorded resolved inputs, then return output + diff."""
+    if state.manager is None:
+        raise HTTPException(status_code=503, detail="orchestrator not initialised")
+    if state.run_store is None:
+        raise HTTPException(status_code=503, detail="run store not initialised")
+
+    parent = state.run_store.get_run(run_id)
+    if parent is None:
+        raise HTTPException(status_code=404, detail=f"no run with id '{run_id}'")
+    if parent["status"] != "completed":
+        raise HTTPException(status_code=409, detail=f"run '{run_id}' is not completed")
+
+    recorded = next((n for n in parent.get("nodes", []) if n.get("node_id") == node_id), None)
+    if recorded is None:
+        raise HTTPException(status_code=404, detail=f"run '{run_id}' has no node '{node_id}'")
+    if recorded.get("status") != "completed":
+        raise HTTPException(status_code=409, detail=f"node '{node_id}' is not replayable (status={recorded.get('status')})")
+
+    # Inputs that required lossy coercion (repr/NaN->None) are not safe to replay.
+    if recorded.get("inputs_lossy"):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"node '{node_id}' inputs were lossy when recorded; "
+                "replay requires JSON-safe, lossless inputs"
+            ),
+        )
+
+    inputs = recorded.get("inputs")
+    if not isinstance(inputs, dict):
+        raise HTTPException(status_code=409, detail=f"node '{node_id}' has no replayable recorded inputs")
+
+    runtime_type = parent["runtime_type"]
+    try:
+        replay_outcome, replay_lros = state.manager.replay_node(runtime_type, node_id, inputs)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except LookupError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    replay_output = json_safe(replay_outcome.output or {})
+    recorded_output = json_safe(recorded.get("output") or {})
+    diff = _structural_diff(recorded_output, replay_output)
+
+    replay_run_id = str(uuid.uuid4())
+    replay_result = {
+        "runtime_type": runtime_type,
+        "run_type": "replay",
+        "succeeded": replay_outcome.status == "completed",
+        "nodes": [replay_outcome.to_dict()],
+        "lros": replay_lros,
+    }
+    state.run_store.create_run(
+        replay_run_id,
+        runtime_type,
+        "replay",
+        {"parent_run_id": run_id, "replay_node_id": node_id},
+        parent_run_id=run_id,
+    )
+    state.run_store.complete_run(replay_run_id, replay_result)
+
+    return {
+        "run_id": replay_run_id,
+        "parent_run_id": run_id,
+        "runtime_type": runtime_type,
+        "node_id": node_id,
+        "component": replay_outcome.component,
+        "status": replay_outcome.status,
+        "output": replay_output,
+        "diff": diff,
+        "lros": replay_lros,
+    }
 
 
 @app.get("/v2/pipelines/{runtime_type}/contract")
@@ -585,6 +710,8 @@ def delete_component(
     if not path.exists():
         raise HTTPException(status_code=404, detail=f"no plugin named '{name}'")
     path.unlink()
+    if state.manager is not None:
+        state.manager.unregister(name)
     return {"deleted": name}
 
 

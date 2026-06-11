@@ -578,3 +578,71 @@ class TestAsyncRun:
         r = client.post("/v2/pipelines/scoring_production/run?async=true", json={})
         assert r.status_code == 422
         assert "violations" in r.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Node replay + output diff — POST /v2/runs/{run_id}/replay/{node_id}
+# ---------------------------------------------------------------------------
+
+class TestReplayEndpoint:
+    RT = "tmp_replay_missing_component"
+    COMPONENT = "tmp_replay_component"
+
+    @pytest.fixture(autouse=True)
+    def _cleanup(self, client):
+        yield
+        client.delete(f"/v2/pipelines/{self.RT}/config")
+        client.delete(f"/v2/components/{self.COMPONENT}")
+
+    def test_replay_completed_node_returns_diff(self, client):
+        parent_run_id = client.post(
+            "/v2/pipelines/scoring_v1/run", json={"source": "sample"}
+        ).json()["run_id"]
+
+        r = client.post(f"/v2/runs/{parent_run_id}/replay/train")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["parent_run_id"] == parent_run_id
+        assert body["node_id"] == "train"
+        assert body["status"] == "completed"
+        assert set(body["diff"].keys()) == {"added", "removed", "changed"}
+
+    def test_replay_unknown_run_id_returns_404(self, client):
+        r = client.post("/v2/runs/no-such-run/replay/train")
+        assert r.status_code == 404
+
+    def test_replay_unknown_node_id_returns_404(self, client):
+        parent_run_id = client.post(
+            "/v2/pipelines/scoring_v1/run", json={"source": "sample"}
+        ).json()["run_id"]
+        r = client.post(f"/v2/runs/{parent_run_id}/replay/no_such_node")
+        assert r.status_code == 404
+
+    def test_replay_component_no_longer_exists_returns_422(self, client):
+        source = (
+            "class TmpReplayComponent:\n"
+            "    def run(self, **inputs) -> dict:\n"
+            "        value = float(inputs.get('value', 0.0))\n"
+            "        return {'pred': value + 1.0}\n"
+        )
+        assert client.post(
+            "/v2/components", json={"name": self.COMPONENT, "source": source}
+        ).status_code == 200
+
+        cfg = {
+            "nodes": [
+                {
+                    "id": "predict",
+                    "component": self.COMPONENT,
+                    "inputs": {"value": 2.0},
+                }
+            ]
+        }
+        assert client.put(f"/v2/pipelines/{self.RT}/config", json=cfg).status_code == 200
+
+        parent_run_id = client.post(f"/v2/pipelines/{self.RT}/run", json={}).json()["run_id"]
+
+        assert client.delete(f"/v2/components/{self.COMPONENT}").status_code == 200
+        r = client.post(f"/v2/runs/{parent_run_id}/replay/predict")
+        assert r.status_code == 422
+        assert "not registered" in r.json()["detail"]

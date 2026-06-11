@@ -23,6 +23,7 @@ must implement:
 
 from __future__ import annotations
 
+import logging
 import math
 import re
 import threading
@@ -35,6 +36,10 @@ from typing import Any
 import yaml
 
 from genesys.manager.lro import LROCollector
+
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
 # Run classification. `run_type` is a free-form label so teams can define
@@ -53,22 +58,37 @@ DEFAULT_RUN_TYPE = "test"
 # Result types
 # ---------------------------------------------------------------------------
 
-def _json_safe(value: Any) -> Any:
-    """Snapshot *value* into a JSON-safe structure for recording.
-
-    Resolved inputs may carry raw upstream data (NaN floats, arbitrary
-    objects). Recorded runs must serialize cleanly, so NaN/Inf become None
-    and unknown objects become their repr.
-    """
+def _json_safe_with_lossiness(value: Any) -> tuple[Any, bool]:
+    """Snapshot *value* into JSON-safe data and report whether conversion was lossy."""
     if isinstance(value, dict):
-        return {str(k): _json_safe(v) for k, v in value.items()}
+        out: dict[str, Any] = {}
+        lossy = False
+        for k, v in value.items():
+            safe_v, child_lossy = _json_safe_with_lossiness(v)
+            out[str(k)] = safe_v
+            lossy = lossy or child_lossy
+        return out, lossy
     if isinstance(value, (list, tuple)):
-        return [_json_safe(v) for v in value]
+        out_list: list[Any] = []
+        lossy = False
+        for v in value:
+            safe_v, child_lossy = _json_safe_with_lossiness(v)
+            out_list.append(safe_v)
+            lossy = lossy or child_lossy
+        return out_list, lossy
     if isinstance(value, float):
-        return value if math.isfinite(value) else None
+        if math.isfinite(value):
+            return value, False
+        return None, True
     if value is None or isinstance(value, (str, int, bool)):
-        return value
-    return repr(value)
+        return value, False
+    return repr(value), True
+
+
+def json_safe(value: Any) -> Any:
+    """Public JSON-safe snapshot used when comparing or storing replay output."""
+    safe_value, _ = _json_safe_with_lossiness(value)
+    return safe_value
 
 
 @dataclass
@@ -82,15 +102,31 @@ class NodeOutcome:
     # Resolved inputs (after ${...} interpolation). Recorded so a stored run
     # can later be replayed node-by-node without re-running upstream nodes.
     inputs: dict[str, Any] | None = None
+    # True when inputs were coerced for storage (e.g. NaN->None or repr(...)).
+    # Replay requires lossless JSON inputs.
+    inputs_lossy: bool = False
 
     def to_dict(self) -> dict[str, Any]:
+        safe_output = None
+        if self.output is not None:
+            safe_output, _ = _json_safe_with_lossiness(self.output)
+
+        safe_inputs = None
+        inferred_inputs_lossy = False
+        if self.inputs is not None:
+            safe_inputs, inferred_inputs_lossy = _json_safe_with_lossiness(self.inputs)
+
         d = {
             "node_id": self.node_id,
             "component": self.component,
             "status": self.status,
-            "output": self.output,
+            # Sanitize at the serialization boundary only — in-process the raw
+            # objects (incl. NaN floats / rich objects) keep flowing between
+            # nodes untouched.
+            "output": safe_output,
             "message": self.message,
-            "inputs": self.inputs,
+            "inputs": safe_inputs,
+            "inputs_lossy": self.inputs_lossy or inferred_inputs_lossy,
         }
         if self.traceback is not None:
             d["traceback"] = self.traceback
@@ -316,6 +352,9 @@ class Manager:
     def list_registered(self) -> list[str]:
         return sorted(self._registry.keys())
 
+    def unregister(self, name: str) -> None:
+        self._registry.pop(name, None)
+
     def list_runtime_types(self) -> list[str]:
         if not self._config_dir.exists():
             return []
@@ -344,6 +383,60 @@ class Manager:
         if not contract_cfg:
             return []
         return _validate_contract(contract_cfg, payload)
+
+    def replay_node(
+        self,
+        runtime_type: str,
+        node_id: str,
+        resolved_inputs: dict[str, Any],
+    ) -> tuple[NodeOutcome, list[dict[str, Any]]]:
+        """Execute one node from the current runtime config using pinned inputs."""
+        config_path = self._config_dir / f"{runtime_type}.yaml"
+        if not config_path.exists():
+            raise FileNotFoundError(f"no pipeline config for runtime_type='{runtime_type}'")
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f) or {}
+
+        nodes_cfg = config.get("nodes", [])
+        target_cfg = next((n for n in nodes_cfg if n.get("id") == node_id), None)
+        if target_cfg is None:
+            raise KeyError(f"node '{node_id}' does not exist in runtime '{runtime_type}'")
+
+        component_name = target_cfg.get("component", "")
+        component = self._registry.get(component_name)
+        if component is None:
+            raise LookupError(f"component '{component_name}' is not registered")
+
+        lro = LROCollector()
+        try:
+            output = component.execute(
+                lro_collector=lro,
+                node_id=node_id,
+                **resolved_inputs,
+            )
+            if output is not None and not isinstance(output, dict):
+                raise TypeError(
+                    f"component '{component_name}' returned {type(output).__name__}; "
+                    "execute() must return a dict (or None)"
+                )
+            outcome = NodeOutcome(
+                node_id=node_id,
+                component=component_name,
+                status="completed",
+                output=output or {},
+                inputs=resolved_inputs,
+            )
+        except Exception as exc:
+            outcome = NodeOutcome(
+                node_id=node_id,
+                component=component_name,
+                status="failed",
+                message=f"{type(exc).__name__}: {exc}",
+                traceback=traceback.format_exc(),
+                inputs=resolved_inputs,
+            )
+        return outcome, lro.snapshot()
 
     # ------------------------------------------------------------------
     # Execution
@@ -459,7 +552,7 @@ class Manager:
                     component=component_name,
                     status="completed",
                     output=output or {},
-                    inputs=_json_safe(inputs),
+                    inputs=inputs,
                 )
             except Exception as exc:
                 return NodeOutcome(
@@ -490,7 +583,7 @@ class Manager:
             in_flight: dict[Future[NodeOutcome], str] = {}
 
             def submit(node_id: str) -> None:
-                print(f"[manager] scheduling node '{node_id}'")
+                logger.info(f"[manager] scheduling node '{node_id}'")
                 in_flight[pool.submit(execute_one, node_id)] = node_id
 
             for nid, count in pending_deps.items():

@@ -44,18 +44,37 @@ needs it running in a production-ready state. Design rules that follow:
 The two workflows the platform exists to serve (modeled on the real product
 this is based on):
 
-1. **Node-scoped development loop.** A data scientist owns a single node in
-   the pipeline. They edit only their code and immediately see how the change
-   affects output data — by re-running their node against the *recorded
-   outputs of a previous run* (pinned upstream inputs, no need to re-run the
-   whole pipeline) and diffing new output vs old.
+1. **Node-scoped development loop.** Concrete API flow:
+   a) edit the component source,
+   b) `POST /v2/components` to hot-reload it,
+   c) `POST /v2/runs/{run_id}/replay/{node_id}` to re-run only that node
+   against pinned recorded inputs,
+   d) read `diff.{added,removed,changed}` in the replay response.
+
+   Example:
+
+   ```bash
+   # 1) Edit + hot-reload one component
+   curl -X POST http://localhost:8000/v2/components \
+     -H "Content-Type: application/json" \
+     -d '{
+       "name": "my_model",
+       "source": "class MyModel:\n    def run(self, **inputs) -> dict:\n        return {\"score\": 0.91}"
+     }'
+
+   # 2) Replay only the target node from a recorded run
+   curl -X POST http://localhost:8000/v2/runs/<run_id>/replay/<node_id>
+   ```
+
+   No upstream nodes are re-executed; replay uses the run's stored resolved
+   inputs for that node.
 2. **Historical replay / backfill.** Rerun years of historical data through a
    pipeline (e.g. after a model change) by fanning the same pipeline out over
    many time windows. Retraining is the recurring special case of this.
 
 Both workflows sit on the same foundation: **recorded runs as first-class,
 addressable objects** (run_id, persisted config + per-node inputs/outputs).
-That is why run persistence is roadmap item #1.
+That foundation now exists: every run is recorded (see `GET /v2/runs`).
 
 ## Architecture at a glance
 
@@ -176,15 +195,14 @@ Reference syntax inside `inputs:`:
 
 ## Roadmap (priority order)
 
-1. **Run persistence + async run API** — runs currently live only inside one
-   HTTP request. `POST /run` should return a `run_id` immediately, execute in
-   the background, and expose `GET /v2/runs/{run_id}` for status/results plus a
-   run-history listing. Persist per-node inputs/outputs so recorded runs can be
-   used as fixtures (see north-star workflows), and include the `run_type`
-   column (already threaded through the manager/API) so production data is
-   distinguishable from test/training/historical runs. The storage layer
-   (`src/genesys/storage/`) already exists; this is mostly wiring. Everything
-   below depends on this.
+1. **Run persistence + async run API** — ✅ done. Every run (sync or async)
+   is recorded in SQLite (`GENESYS_RUNS_DB`, default `data/genesys_runs.db`)
+   with its `run_id`, `run_type`, request payload, and per-node **resolved
+   inputs and outputs** — so recorded runs can be used as fixtures (see
+   north-star workflows). `POST /run?async=true` returns `202 {run_id}`
+   immediately and executes in the background; `GET /v2/runs/{run_id}` polls
+   status/results, `GET /v2/runs` lists history with `run_type` /
+   `runtime_type` / `status` filters.
 2. **Node dev loop: pinned replay + output diff** — run a single node against
    the recorded run_context of a previous run (no upstream re-execution), and
    diff its output against what that run produced. This is the data
@@ -220,7 +238,10 @@ Reference syntax inside `inputs:`:
 | --- | --- | --- |
 | GET | `/health` | Liveness check |
 | GET | `/v2/runtimes` | List available runtime types (one per YAML) |
-| POST | `/v2/pipelines/{runtime_type}/run` | Run a pipeline with a JSON body |
+| POST | `/v2/pipelines/{runtime_type}/run` | Run a pipeline with a JSON body (add `?async=true` for 202 + background execution) |
+| GET | `/v2/runs` | Run history, newest first (`?run_type=` / `?runtime_type=` / `?status=` / `?limit=`) |
+| GET | `/v2/runs/{run_id}` | Full run record: status, request, per-node resolved inputs + outputs |
+| POST | `/v2/runs/{run_id}/replay/{node_id}` | Re-run one completed node against recorded inputs; returns replay output + structural diff (`added`/`removed`/`changed`) |
 | GET | `/v2/pipelines/{runtime_type}/contract` | Input contract for upstream callers |
 | GET/PUT/DELETE | `/v2/pipelines/{runtime_type}/config` | Pipeline YAML CRUD (PUT fully validates before writing) |
 | POST | `/v2/pipelines/{runtime_type}/validate` | Dry-run config validation — same checks as PUT, no write |
@@ -237,11 +258,12 @@ Optional headers on `/run`:
   choose their own labels — e.g. `team_a_check`, `chris_experiment`,
   `training`, `historical` — so multiple teams can run their own verification
   passes and find their output data downstream. Echoed in the response,
-  exposed to pipelines as `${run.run_type}`, and stored on every run record
-  once run persistence lands. **Rules:** labels must be lowercase slugs
-  (letters, digits, `_`, `-`; 422 otherwise — a stray space or typo'd format
-  can't create unqueryable values), and `production` is the single reserved
-  label downstream business consumers treat as customer-grade/verified. It is
+  exposed to pipelines as `${run.run_type}`, stored on every run record, and
+  filterable via `GET /v2/runs?run_type=...`. **Rules:** labels must be
+  lowercase slugs (letters, digits, `_`, `-`; 422 otherwise — a stray space or
+  typo'd format can't create unqueryable values), and `production` is the
+  single reserved label downstream business consumers treat as
+  customer-grade/verified. It is
   never a default — callers must assert it explicitly; everything else is
   non-production by definition.
 - `X-Debug-Component-List`: comma-separated component names; only those run,
@@ -254,6 +276,7 @@ Environment variables:
 - `PIPELINE_CONFIGS_DIR` (default `pipeline_configs`)
 - `PLUGINS_DIR` (default `plugins`)
 - `MANAGER_MAX_WORKERS` (default `8`) — per-level thread cap
+- `GENESYS_RUNS_DB` (default `data/genesys_runs.db`) — SQLite file recording every run
 - `GENESYS_API_KEY` (unset by default) — see "Live editing & the API key gate"
 
 ## Live editing & the API key gate
