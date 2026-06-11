@@ -66,6 +66,10 @@ class RunStore:
                     runtime_type TEXT NOT NULL,
                     run_type     TEXT NOT NULL,
                     parent_run_id TEXT,
+                    backfill_id  TEXT,
+                    backfill_window_id TEXT,
+                    window_start TEXT,
+                    window_end   TEXT,
                     status       TEXT NOT NULL,   -- running | completed | error
                     succeeded    INTEGER,         -- NULL while running
                     request      TEXT NOT NULL,   -- JSON request payload
@@ -93,10 +97,30 @@ class RunStore:
                 CREATE INDEX IF NOT EXISTS idx_runs_runtime  ON runs(runtime_type);
                 CREATE INDEX IF NOT EXISTS idx_runs_run_type ON runs(run_type);
                 CREATE INDEX IF NOT EXISTS idx_runs_parent   ON runs(parent_run_id);
+                CREATE INDEX IF NOT EXISTS idx_runs_backfill ON runs(backfill_id);
                 CREATE INDEX IF NOT EXISTS idx_runs_started  ON runs(started_at);
                 CREATE INDEX IF NOT EXISTS idx_run_nodes_run ON run_nodes(run_id);
+
+                CREATE TABLE IF NOT EXISTS backfills (
+                    backfill_id          TEXT PRIMARY KEY,
+                    runtime_type         TEXT NOT NULL,
+                    status               TEXT NOT NULL,
+                    run_type             TEXT NOT NULL,
+                    failure_mode         TEXT NOT NULL,
+                    max_concurrent_runs  INTEGER NOT NULL,
+                    total_windows        INTEGER NOT NULL,
+                    succeeded_windows    INTEGER NOT NULL DEFAULT 0,
+                    failed_windows       INTEGER NOT NULL DEFAULT 0,
+                    started_at           TEXT NOT NULL,
+                    finished_at          TEXT,
+                    error                TEXT
+                );
             """)
             self._ensure_column(conn, "runs", "parent_run_id", "TEXT")
+            self._ensure_column(conn, "runs", "backfill_id", "TEXT")
+            self._ensure_column(conn, "runs", "backfill_window_id", "TEXT")
+            self._ensure_column(conn, "runs", "window_start", "TEXT")
+            self._ensure_column(conn, "runs", "window_end", "TEXT")
             self._ensure_column(conn, "run_nodes", "inputs_lossy", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "run_nodes", "started_at", "REAL")
             self._ensure_column(conn, "run_nodes", "finished_at", "REAL")
@@ -118,14 +142,108 @@ class RunStore:
         run_type: str,
         request_payload: dict[str, Any],
         parent_run_id: str | None = None,
+        backfill_id: str | None = None,
+        backfill_window_id: str | None = None,
+        window_start: str | None = None,
+        window_end: str | None = None,
     ) -> None:
         """Record a new run in 'running' state."""
         with self._lock, self._connect() as conn:
             conn.execute(
-                "INSERT INTO runs (run_id, runtime_type, run_type, parent_run_id, status, request, started_at) "
-                "VALUES (?, ?, ?, ?, 'running', ?, ?)",
-                (run_id, runtime_type, run_type, parent_run_id, json.dumps(request_payload), _now()),
+                "INSERT INTO runs ("
+                "run_id, runtime_type, run_type, parent_run_id, backfill_id, backfill_window_id, "
+                "window_start, window_end, status, request, started_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?)",
+                (
+                    run_id,
+                    runtime_type,
+                    run_type,
+                    parent_run_id,
+                    backfill_id,
+                    backfill_window_id,
+                    window_start,
+                    window_end,
+                    json.dumps(request_payload),
+                    _now(),
+                ),
             )
+
+    def create_backfill(
+        self,
+        backfill_id: str,
+        runtime_type: str,
+        run_type: str,
+        failure_mode: str,
+        max_concurrent_runs: int,
+        total_windows: int,
+    ) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO backfills ("
+                "backfill_id, runtime_type, status, run_type, failure_mode, "
+                "max_concurrent_runs, total_windows, started_at"
+                ") VALUES (?, ?, 'running', ?, ?, ?, ?, ?)",
+                (
+                    backfill_id,
+                    runtime_type,
+                    run_type,
+                    failure_mode,
+                    max_concurrent_runs,
+                    total_windows,
+                    _now(),
+                ),
+            )
+
+    def update_backfill_progress(
+        self,
+        backfill_id: str,
+        *,
+        succeeded_delta: int = 0,
+        failed_delta: int = 0,
+    ) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE backfills "
+                "SET succeeded_windows = succeeded_windows + ?, failed_windows = failed_windows + ? "
+                "WHERE backfill_id = ?",
+                (succeeded_delta, failed_delta, backfill_id),
+            )
+
+    def complete_backfill(
+        self,
+        backfill_id: str,
+        *,
+        status: str,
+        error: str | None = None,
+    ) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE backfills SET status=?, finished_at=?, error=? WHERE backfill_id=?",
+                (status, _now(), error, backfill_id),
+            )
+
+    def get_backfill(self, backfill_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM backfills WHERE backfill_id=?",
+                (backfill_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "backfill_id": row["backfill_id"],
+            "runtime_type": row["runtime_type"],
+            "status": row["status"],
+            "run_type": row["run_type"],
+            "failure_mode": row["failure_mode"],
+            "max_concurrent_runs": row["max_concurrent_runs"],
+            "total_windows": row["total_windows"],
+            "succeeded_windows": row["succeeded_windows"],
+            "failed_windows": row["failed_windows"],
+            "started_at": row["started_at"],
+            "finished_at": row["finished_at"],
+            "error": row["error"],
+        }
 
     def complete_run(self, run_id: str, result: dict[str, Any]) -> None:
         """Mark a run completed and store its full result.
@@ -185,7 +303,11 @@ class RunStore:
             if row is None:
                 return None
             node_rows = conn.execute(
-                "SELECT * FROM run_nodes WHERE run_id=? ORDER BY recorded_at, node_id",
+                # rowid preserves insertion order, which complete_run writes in
+                # pipeline-config order (recorded_at is identical for every
+                # node of a run, so sorting by it would fall back to
+                # alphabetical node_id and scramble the pipeline order).
+                "SELECT * FROM run_nodes WHERE run_id=? ORDER BY rowid",
                 (run_id,),
             ).fetchall()
 
@@ -214,6 +336,7 @@ class RunStore:
         runtime_type: str | None = None,
         run_type: str | None = None,
         status: str | None = None,
+        backfill_id: str | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> tuple[list[dict[str, Any]], int]:
@@ -233,6 +356,9 @@ class RunStore:
         if status is not None:
             clauses.append("status = ?")
             params.append(status)
+        if backfill_id is not None:
+            clauses.append("backfill_id = ?")
+            params.append(backfill_id)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         clamped_limit = max(1, min(limit, 500))
         clamped_offset = max(0, offset)
@@ -255,6 +381,10 @@ class RunStore:
             "runtime_type": row["runtime_type"],
             "run_type": row["run_type"],
             "parent_run_id": row["parent_run_id"],
+            "backfill_id": row["backfill_id"],
+            "backfill_window_id": row["backfill_window_id"],
+            "window_start": row["window_start"],
+            "window_end": row["window_end"],
             "status": row["status"],
             "succeeded": None if row["succeeded"] is None else bool(row["succeeded"]),
             "started_at": row["started_at"],

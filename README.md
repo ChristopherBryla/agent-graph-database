@@ -413,6 +413,9 @@ This keeps existing run APIs intact while enabling direct filtering by
 | GET | `/health` | Liveness check |
 | GET | `/v2/runtimes` | List available runtime types (one per YAML) |
 | POST | `/v2/pipelines/{runtime_type}/run` | Run a pipeline with a JSON body (add `?async=true` for 202 + background execution) |
+| POST | `/v2/backfills` | Start an async backfill batch across many windows |
+| GET | `/v2/backfills/{backfill_id}` | Backfill batch summary/status |
+| GET | `/v2/backfills/{backfill_id}/runs` | Paginated child runs for one backfill |
 | GET | `/v2/runs` | Run history, newest first (`?run_type=` / `?runtime_type=` / `?status=` / `?limit=`) |
 | GET | `/v2/runs/{run_id}` | Full run record: status, request, per-node resolved inputs + outputs |
 | POST | `/v2/runs/{run_id}/replay/{node_id}` | Re-run one completed node against recorded inputs; returns replay output + structural diff (`added`/`removed`/`changed`) |

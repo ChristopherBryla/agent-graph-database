@@ -4,10 +4,12 @@ Covers HTTP behaviour: status codes, response structure, header processing.
 All tests run entirely in-process via FastAPI TestClient — no Docker needed.
 """
 
+import time
+
 import pytest
 from fastapi.testclient import TestClient
 
-from genesys.app import app
+from genesys.app import app, state
 
 
 @pytest.fixture(scope="module")
@@ -513,6 +515,15 @@ class TestRunPersistence:
             assert isinstance(node["finished_at"], float)
             assert node["finished_at"] >= node["started_at"]
 
+    def test_record_preserves_pipeline_node_order(self, client):
+        # Regression: ORDER BY recorded_at degenerated to alphabetical order
+        # (fetch, persist, train) because every node shares one recorded_at.
+        run_id = client.post(
+            "/v2/pipelines/scoring_v1/run", json={"source": "sample"}
+        ).json()["run_id"]
+        record = client.get(f"/v2/runs/{run_id}").json()
+        assert [n["node_id"] for n in record["nodes"]] == ["fetch", "train", "persist"]
+
     def test_unknown_run_id_returns_404(self, client):
         assert client.get("/v2/runs/no-such-run").status_code == 404
 
@@ -627,18 +638,181 @@ class TestAsyncRun:
 
 
 # ---------------------------------------------------------------------------
+# Backfills — POST /v2/backfills
+# ---------------------------------------------------------------------------
+
+class TestBackfills:
+    RT = "tmp_backfill_runtime"
+
+    @pytest.fixture(autouse=True)
+    def _setup_runtime(self, client):
+        cfg = {
+            "nodes": [
+                {
+                    "id": "fetch",
+                    "component": "data_provider",
+                    "inputs": {
+                        "source": "${request.source}",
+                        "start": "${request.start}",
+                        "end": "${request.end}",
+                    },
+                }
+            ]
+        }
+        assert client.put(f"/v2/pipelines/{self.RT}/config", json=cfg).status_code == 200
+        yield
+        client.delete(f"/v2/pipelines/{self.RT}/config")
+
+    @staticmethod
+    def _wait_for_backfill(backfill_id: str, timeout_s: float = 5.0) -> dict:
+        start = time.time()
+        while time.time() - start < timeout_s:
+            record = state.run_store.get_backfill(backfill_id)
+            if record and record["status"] != "running":
+                return record
+            time.sleep(0.05)
+        raise AssertionError(f"backfill {backfill_id} did not finish in time")
+
+    def test_post_backfill_returns_202(self, client):
+        payload = {
+            "runtime_type": self.RT,
+            "base_payload": {"source": "sample"},
+            "windows": [
+                {"window_id": "w1", "start": "2024-01-01T00:00:00Z", "end": "2024-01-03T00:00:00Z"}
+            ],
+        }
+        r = client.post("/v2/backfills", json=payload)
+        assert r.status_code == 202
+        body = r.json()
+        assert body["status"] == "running"
+        assert body["runtime_type"] == self.RT
+        assert body["total_windows"] == 1
+        assert body["failure_mode"] == "continue"
+
+    def test_backfill_continue_runs_all_windows_and_records_lineage(self, client):
+        run_type = "tmp_backfill_continue"
+        payload = {
+            "runtime_type": self.RT,
+            "run_type": run_type,
+            "failure_mode": "continue",
+            "max_concurrent_runs": 2,
+            "base_payload": {"source": "sample"},
+            "windows": [
+                {"window_id": "ok_1", "start": "2024-01-01T00:00:00Z", "end": "2024-01-03T00:00:00Z"},
+                {"window_id": "bad", "start": "not-iso", "end": "2024-01-04T00:00:00Z"},
+                {"window_id": "ok_2", "start": "2024-01-05T00:00:00Z", "end": "2024-01-06T00:00:00Z"},
+            ],
+        }
+
+        backfill_id = client.post("/v2/backfills", json=payload).json()["backfill_id"]
+        summary = self._wait_for_backfill(backfill_id)
+        assert summary["status"] == "completed_with_errors"
+        assert summary["total_windows"] == 3
+        assert summary["succeeded_windows"] == 2
+        assert summary["failed_windows"] == 1
+
+        runs = client.get(f"/v2/runs?runtime_type={self.RT}&run_type={run_type}&limit=500").json()["runs"]
+        backfill_runs = [r for r in runs if r["backfill_id"] == backfill_id]
+        assert len(backfill_runs) == 3
+        assert {r["backfill_window_id"] for r in backfill_runs} == {"ok_1", "bad", "ok_2"}
+        assert all(r["window_start"] is not None and r["window_end"] is not None for r in backfill_runs)
+
+    def test_backfill_stop_halts_after_first_failure(self, client):
+        run_type = "tmp_backfill_stop"
+        payload = {
+            "runtime_type": self.RT,
+            "run_type": run_type,
+            "failure_mode": "stop",
+            "max_concurrent_runs": 1,
+            "base_payload": {"source": "sample"},
+            "windows": [
+                {"window_id": "bad_first", "start": "not-iso", "end": "2024-01-04T00:00:00Z"},
+                {"window_id": "would_have_run", "start": "2024-01-05T00:00:00Z", "end": "2024-01-06T00:00:00Z"},
+            ],
+        }
+
+        backfill_id = client.post("/v2/backfills", json=payload).json()["backfill_id"]
+        summary = self._wait_for_backfill(backfill_id)
+        assert summary["status"] == "failed"
+        assert summary["succeeded_windows"] == 0
+        assert summary["failed_windows"] == 1
+
+        runs = client.get(f"/v2/runs?runtime_type={self.RT}&run_type={run_type}&limit=500").json()["runs"]
+        backfill_runs = [r for r in runs if r["backfill_id"] == backfill_id]
+        assert len(backfill_runs) == 1
+        assert backfill_runs[0]["backfill_window_id"] == "bad_first"
+
+    def test_get_backfill_summary_endpoint(self, client):
+        payload = {
+            "runtime_type": self.RT,
+            "run_type": "tmp_backfill_summary",
+            "base_payload": {"source": "sample"},
+            "windows": [
+                {"window_id": "w1", "start": "2024-01-01T00:00:00Z", "end": "2024-01-02T00:00:00Z"},
+                {"window_id": "w2", "start": "2024-01-02T00:00:00Z", "end": "2024-01-03T00:00:00Z"},
+            ],
+        }
+        backfill_id = client.post("/v2/backfills", json=payload).json()["backfill_id"]
+        summary = self._wait_for_backfill(backfill_id)
+
+        r = client.get(f"/v2/backfills/{backfill_id}")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["backfill_id"] == backfill_id
+        assert body["runtime_type"] == self.RT
+        assert body["total_windows"] == 2
+        assert body["status"] == summary["status"]
+
+    def test_get_backfill_runs_endpoint_paginates(self, client):
+        payload = {
+            "runtime_type": self.RT,
+            "run_type": "tmp_backfill_runs_api",
+            "base_payload": {"source": "sample"},
+            "windows": [
+                {"window_id": "w1", "start": "2024-01-01T00:00:00Z", "end": "2024-01-02T00:00:00Z"},
+                {"window_id": "w2", "start": "2024-01-02T00:00:00Z", "end": "2024-01-03T00:00:00Z"},
+                {"window_id": "w3", "start": "2024-01-03T00:00:00Z", "end": "2024-01-04T00:00:00Z"},
+            ],
+        }
+        backfill_id = client.post("/v2/backfills", json=payload).json()["backfill_id"]
+        self._wait_for_backfill(backfill_id)
+
+        first = client.get(f"/v2/backfills/{backfill_id}/runs?limit=1&offset=0")
+        second = client.get(f"/v2/backfills/{backfill_id}/runs?limit=1&offset=1")
+        assert first.status_code == 200
+        assert second.status_code == 200
+        first_body = first.json()
+        second_body = second.json()
+        assert first_body["count"] == 3
+        assert second_body["count"] == 3
+        assert len(first_body["runs"]) == 1
+        assert len(second_body["runs"]) == 1
+        assert first_body["runs"][0]["run_id"] != second_body["runs"][0]["run_id"]
+
+    def test_get_backfill_endpoints_unknown_id_returns_404(self, client):
+        assert client.get("/v2/backfills/no-such-backfill").status_code == 404
+        assert client.get("/v2/backfills/no-such-backfill/runs").status_code == 404
+
+
+# ---------------------------------------------------------------------------
 # Node replay + output diff — POST /v2/runs/{run_id}/replay/{node_id}
 # ---------------------------------------------------------------------------
 
 class TestReplayEndpoint:
     RT = "tmp_replay_missing_component"
     COMPONENT = "tmp_replay_component"
+    LOSSY_RT = "tmp_replay_lossy"
+    LOSSY_SOURCE = "tmp_replay_nan_source"
+    LOSSY_SINK = "tmp_replay_nan_sink"
 
     @pytest.fixture(autouse=True)
     def _cleanup(self, client):
         yield
         client.delete(f"/v2/pipelines/{self.RT}/config")
         client.delete(f"/v2/components/{self.COMPONENT}")
+        client.delete(f"/v2/pipelines/{self.LOSSY_RT}/config")
+        client.delete(f"/v2/components/{self.LOSSY_SOURCE}")
+        client.delete(f"/v2/components/{self.LOSSY_SINK}")
 
     def test_replay_completed_node_returns_diff(self, client):
         parent_run_id = client.post(
@@ -652,6 +826,64 @@ class TestReplayEndpoint:
         assert body["node_id"] == "train"
         assert body["status"] == "completed"
         assert set(body["diff"].keys()) == {"added", "removed", "changed"}
+
+    def test_replay_run_is_persisted_with_parent_link(self, client):
+        parent_run_id = client.post(
+            "/v2/pipelines/scoring_v1/run", json={"source": "sample"}
+        ).json()["run_id"]
+        replay = client.post(f"/v2/runs/{parent_run_id}/replay/train").json()
+
+        record = client.get(f"/v2/runs/{replay['run_id']}").json()
+        assert record["status"] == "completed"
+        assert record["run_type"] == "replay"
+        assert record["parent_run_id"] == parent_run_id
+        assert record["request"] == {
+            "parent_run_id": parent_run_id,
+            "replay_node_id": "train",
+        }
+        assert [n["node_id"] for n in record["nodes"]] == ["train"]
+
+    def test_replay_lossy_inputs_returns_422(self, client):
+        # A node whose recorded inputs required lossy coercion (NaN -> null)
+        # must refuse replay: the pinned inputs no longer equal what ran.
+        nan_source = (
+            "class TmpReplayNanSource:\n"
+            "    def run(self, **inputs) -> dict:\n"
+            "        return {'value': float('nan')}\n"
+        )
+        sink = (
+            "class TmpReplayNanSink:\n"
+            "    def run(self, **inputs) -> dict:\n"
+            "        return {'echo': str(inputs.get('value'))}\n"
+        )
+        assert client.post(
+            "/v2/components", json={"name": self.LOSSY_SOURCE, "source": nan_source}
+        ).status_code == 200
+        assert client.post(
+            "/v2/components", json={"name": self.LOSSY_SINK, "source": sink}
+        ).status_code == 200
+
+        cfg = {
+            "nodes": [
+                {"id": "make_nan", "component": self.LOSSY_SOURCE},
+                {
+                    "id": "sink",
+                    "component": self.LOSSY_SINK,
+                    "depends_on": ["make_nan"],
+                    "inputs": {"value": "${make_nan.output.value}"},
+                },
+            ]
+        }
+        assert client.put(f"/v2/pipelines/{self.LOSSY_RT}/config", json=cfg).status_code == 200
+
+        run_id = client.post(f"/v2/pipelines/{self.LOSSY_RT}/run", json={}).json()["run_id"]
+        record = client.get(f"/v2/runs/{run_id}").json()
+        sink_node = next(n for n in record["nodes"] if n["node_id"] == "sink")
+        assert sink_node["inputs_lossy"] is True
+
+        r = client.post(f"/v2/runs/{run_id}/replay/sink")
+        assert r.status_code == 422
+        assert "lossy" in r.json()["detail"]
 
     def test_replay_unknown_run_id_returns_404(self, client):
         r = client.post("/v2/runs/no-such-run/replay/train")

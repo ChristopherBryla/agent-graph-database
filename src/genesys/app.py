@@ -8,6 +8,7 @@ import re
 import secrets
 import threading
 import uuid
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -60,6 +61,7 @@ MODEL_BLOBS_PATH = os.getenv("GENESYS_MODEL_BLOBS_DIR", "data/blobs")
 
 # Built-in infrastructure components — hidden from the pipeline node dropdown.
 _INFRASTRUCTURE = {"data_provider", "save_results", "save_model", "load_model", "linear_predict"}
+_BACKFILL_FAILURE_MODES = {"continue", "stop"}
 
 
 # ---------------------------------------------------------------------------
@@ -387,6 +389,249 @@ def get_run(run_id: str) -> dict[str, Any]:
     if record is None:
         raise HTTPException(status_code=404, detail=f"no run with id '{run_id}'")
     return record
+
+
+def _validate_backfill_windows(windows: Any) -> list[dict[str, str]]:
+    if not isinstance(windows, list) or not windows:
+        raise HTTPException(status_code=422, detail="windows must be a non-empty list")
+
+    normalized: list[dict[str, str]] = []
+    seen_window_ids: set[str] = set()
+    for idx, raw in enumerate(windows):
+        if not isinstance(raw, dict):
+            raise HTTPException(status_code=422, detail=f"windows[{idx}] must be an object")
+
+        window_id = str(raw.get("window_id", "")).strip()
+        start = str(raw.get("start", "")).strip()
+        end = str(raw.get("end", "")).strip()
+        if not window_id:
+            raise HTTPException(status_code=422, detail=f"windows[{idx}].window_id is required")
+        if not start:
+            raise HTTPException(status_code=422, detail=f"windows[{idx}].start is required")
+        if not end:
+            raise HTTPException(status_code=422, detail=f"windows[{idx}].end is required")
+        if window_id in seen_window_ids:
+            raise HTTPException(status_code=422, detail=f"duplicate window_id '{window_id}'")
+        seen_window_ids.add(window_id)
+        normalized.append({"window_id": window_id, "start": start, "end": end})
+
+    return normalized
+
+
+@app.post("/v2/backfills")
+async def create_backfill(
+    request: Request,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> JSONResponse:
+    """Create and start a multi-window backfill batch asynchronously."""
+    _check_api_key(x_api_key, "creating a backfill")
+    if state.manager is None:
+        raise HTTPException(status_code=503, detail="orchestrator not initialised")
+    if state.run_store is None:
+        raise HTTPException(status_code=503, detail="run store not initialised")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="body must be valid JSON")
+
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="body must be a JSON object")
+
+    runtime_type = str(body.get("runtime_type", "")).strip()
+    if not runtime_type:
+        raise HTTPException(status_code=422, detail="runtime_type is required")
+
+    base_payload = body.get("base_payload", {})
+    if not isinstance(base_payload, dict):
+        raise HTTPException(status_code=422, detail="base_payload must be an object")
+
+    windows = _validate_backfill_windows(body.get("windows"))
+
+    raw_concurrency = body.get("max_concurrent_runs", 4)
+    if not isinstance(raw_concurrency, int):
+        raise HTTPException(status_code=422, detail="max_concurrent_runs must be an integer")
+    max_concurrent_runs = max(1, min(raw_concurrency, 32))
+
+    run_type = str(body.get("run_type", "historical")).strip().lower()
+    if not RUN_TYPE_RE.match(run_type):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"invalid run_type '{run_type}' — must be a lowercase slug "
+                "(letters, digits, '_', '-'; starting with a letter; max 64 chars)"
+            ),
+        )
+
+    failure_mode = str(body.get("failure_mode", "continue")).strip().lower()
+    if failure_mode not in _BACKFILL_FAILURE_MODES:
+        raise HTTPException(status_code=422, detail="failure_mode must be 'continue' or 'stop'")
+
+    if runtime_type not in state.manager.list_runtime_types():
+        raise HTTPException(status_code=404, detail=f"no pipeline config for runtime_type='{runtime_type}'")
+
+    # Validate request contracts up-front so malformed batches fail fast.
+    for window in windows:
+        candidate_payload = {
+            **base_payload,
+            "start": window["start"],
+            "end": window["end"],
+            "window_id": window["window_id"],
+        }
+        violations = state.manager.validate_request(runtime_type, candidate_payload)
+        if violations:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": "backfill window request failed contract validation",
+                    "window_id": window["window_id"],
+                    "violations": violations,
+                },
+            )
+
+    backfill_id = str(uuid.uuid4())
+    state.run_store.create_backfill(
+        backfill_id=backfill_id,
+        runtime_type=runtime_type,
+        run_type=run_type,
+        failure_mode=failure_mode,
+        max_concurrent_runs=max_concurrent_runs,
+        total_windows=len(windows),
+    )
+
+    manager, run_store = state.manager, state.run_store
+
+    def _run_backfill_batch() -> None:
+        stop_scheduling = False
+        next_index = 0
+
+        def submit_next(
+            pool: ThreadPoolExecutor,
+            in_flight: dict[Future[bool], dict[str, str]],
+        ) -> bool:
+            nonlocal next_index
+            if stop_scheduling or next_index >= len(windows):
+                return False
+            window = windows[next_index]
+            next_index += 1
+            in_flight[pool.submit(run_window, window)] = window
+            return True
+
+        def run_window(window: dict[str, str]) -> bool:
+            child_payload = {
+                **base_payload,
+                "start": window["start"],
+                "end": window["end"],
+                "window_id": window["window_id"],
+            }
+            child_run_id = str(uuid.uuid4())
+            run_store.create_run(
+                child_run_id,
+                runtime_type,
+                run_type,
+                child_payload,
+                backfill_id=backfill_id,
+                backfill_window_id=window["window_id"],
+                window_start=window["start"],
+                window_end=window["end"],
+            )
+            options = RunOptions(run_type=run_type)
+            try:
+                result = manager.run(runtime_type, child_payload, options, run_id=child_run_id)
+                run_store.complete_run(child_run_id, result.to_dict())
+                return result.succeeded
+            except Exception as exc:
+                run_store.fail_run(child_run_id, f"{type(exc).__name__}: {exc}")
+                return False
+
+        try:
+            with ThreadPoolExecutor(max_workers=max_concurrent_runs) as pool:
+                in_flight: dict[Future[bool], dict[str, str]] = {}
+                for _ in range(max_concurrent_runs):
+                    if not submit_next(pool, in_flight):
+                        break
+
+                while in_flight:
+                    done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        in_flight.pop(future)
+                        ok = future.result()
+                        if ok:
+                            run_store.update_backfill_progress(backfill_id, succeeded_delta=1)
+                        else:
+                            run_store.update_backfill_progress(backfill_id, failed_delta=1)
+                            if failure_mode == "stop":
+                                stop_scheduling = True
+
+                    for _ in range(len(done)):
+                        if not submit_next(pool, in_flight):
+                            break
+
+            summary = run_store.get_backfill(backfill_id)
+            if summary is None:
+                return
+
+            succeeded_windows = int(summary["succeeded_windows"])
+            failed_windows = int(summary["failed_windows"])
+            if failed_windows == 0 and succeeded_windows == len(windows):
+                final_status = "completed"
+            elif succeeded_windows > 0 and failed_windows > 0:
+                final_status = "completed_with_errors"
+            elif failed_windows > 0:
+                final_status = "failed"
+            else:
+                final_status = "failed"
+            run_store.complete_backfill(backfill_id, status=final_status)
+        except Exception as exc:
+            run_store.complete_backfill(
+                backfill_id,
+                status="failed",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
+    threading.Thread(target=_run_backfill_batch, daemon=True).start()
+    return JSONResponse(
+        status_code=202,
+        content={
+            "backfill_id": backfill_id,
+            "status": "running",
+            "runtime_type": runtime_type,
+            "total_windows": len(windows),
+            "max_concurrent_runs": max_concurrent_runs,
+            "failure_mode": failure_mode,
+        },
+    )
+
+
+@app.get("/v2/backfills/{backfill_id}")
+def get_backfill(backfill_id: str) -> dict[str, Any]:
+    if state.run_store is None:
+        raise HTTPException(status_code=503, detail="run store not initialised")
+    summary = state.run_store.get_backfill(backfill_id)
+    if summary is None:
+        raise HTTPException(status_code=404, detail=f"no backfill with id '{backfill_id}'")
+    return summary
+
+
+@app.get("/v2/backfills/{backfill_id}/runs")
+def list_backfill_runs(
+    backfill_id: str,
+    status: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict[str, Any]:
+    if state.run_store is None:
+        raise HTTPException(status_code=503, detail="run store not initialised")
+    if state.run_store.get_backfill(backfill_id) is None:
+        raise HTTPException(status_code=404, detail=f"no backfill with id '{backfill_id}'")
+
+    runs, count = state.run_store.list_runs(
+        status=status,
+        backfill_id=backfill_id,
+        limit=limit,
+        offset=offset,
+    )
+    return {"runs": runs, "count": count}
 
 
 def _json_path(base: str, key: str | int) -> str:
