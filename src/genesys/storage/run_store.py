@@ -83,6 +83,8 @@ class RunStore:
                     status      TEXT NOT NULL,
                     message     TEXT,
                     inputs_lossy INTEGER NOT NULL DEFAULT 0,
+                    started_at  REAL,
+                    finished_at REAL,
                     inputs      TEXT,             -- JSON resolved inputs
                     output      TEXT,             -- JSON node output
                     recorded_at TEXT NOT NULL
@@ -96,6 +98,8 @@ class RunStore:
             """)
             self._ensure_column(conn, "runs", "parent_run_id", "TEXT")
             self._ensure_column(conn, "run_nodes", "inputs_lossy", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "run_nodes", "started_at", "REAL")
+            self._ensure_column(conn, "run_nodes", "finished_at", "REAL")
 
     @staticmethod
     def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
@@ -143,8 +147,8 @@ class RunStore:
             for node in result.get("nodes", []):
                 conn.execute(
                     "INSERT INTO run_nodes "
-                    "(id, run_id, node_id, component, status, message, inputs_lossy, inputs, output, recorded_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "(id, run_id, node_id, component, status, message, inputs_lossy, started_at, finished_at, inputs, output, recorded_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         str(uuid.uuid4()),
                         run_id,
@@ -153,6 +157,8 @@ class RunStore:
                         node.get("status", ""),
                         node.get("message", ""),
                         1 if node.get("inputs_lossy") else 0,
+                        node.get("started_at"),
+                        node.get("finished_at"),
                         json.dumps(node.get("inputs")),
                         json.dumps(node.get("output")),
                         now,
@@ -194,6 +200,8 @@ class RunStore:
                 "status": n["status"],
                 "message": n["message"],
                 "inputs_lossy": bool(n["inputs_lossy"]),
+                "started_at": n["started_at"],
+                "finished_at": n["finished_at"],
                 "inputs": json.loads(n["inputs"]) if n["inputs"] else None,
                 "output": json.loads(n["output"]) if n["output"] else None,
             }
@@ -207,8 +215,13 @@ class RunStore:
         run_type: str | None = None,
         status: str | None = None,
         limit: int = 50,
-    ) -> list[dict[str, Any]]:
-        """Run metadata (no node payloads), newest first, with optional filters."""
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Run metadata (no node payloads), newest first, with optional filters.
+
+        Returns (runs, count) where count is the total matching rows before
+        LIMIT/OFFSET pagination.
+        """
         clauses: list[str] = []
         params: list[Any] = []
         if runtime_type is not None:
@@ -221,14 +234,19 @@ class RunStore:
             clauses.append("status = ?")
             params.append(status)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        params.append(max(1, min(limit, 500)))
+        clamped_limit = max(1, min(limit, 500))
+        clamped_offset = max(0, offset)
 
         with self._connect() as conn:
-            rows = conn.execute(
-                f"SELECT * FROM runs {where} ORDER BY started_at DESC LIMIT ?",
+            total = conn.execute(
+                f"SELECT COUNT(*) AS total FROM runs {where}",
                 params,
+            ).fetchone()["total"]
+            rows = conn.execute(
+                f"SELECT * FROM runs {where} ORDER BY started_at DESC LIMIT ? OFFSET ?",
+                [*params, clamped_limit, clamped_offset],
             ).fetchall()
-        return [self._run_metadata(r) for r in rows]
+        return [self._run_metadata(r) for r in rows], int(total)
 
     @staticmethod
     def _run_metadata(row: sqlite3.Row) -> dict[str, Any]:

@@ -81,12 +81,16 @@ Add/extend .gitignore: `__pycache__/`, `*.pyc`, `data/genesys_runs.db`,
 tracking (`git rm --cached`), but ask Chris before pushing.
 
 ### B3. [small] Run record timings
+Status: ✅ completed (June 11, 2026)
+
 LRO durations are already captured. Add `started_at`/`finished_at` per node
 row in RunStore (record at execute start/end inside Manager — NodeOutcome
 gains two optional float fields, threaded into run_nodes columns). Additive,
 follow the existing NodeOutcome → complete_run flow.
 
 ### B4. [small] GET /v2/runs pagination polish
+Status: ✅ completed (June 11, 2026)
+
 Add `offset` param to RunStore.list_runs + endpoint, and return
 `{"runs": [...], "count": N}`. Mechanical; mirror the existing limit clamp.
 

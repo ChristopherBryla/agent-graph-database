@@ -346,6 +346,7 @@ def list_runs(
     run_type: str | None = None,
     status: str | None = None,
     limit: int = 50,
+    offset: int = 0,
 ) -> dict[str, Any]:
     """Run history (newest first). Filter by runtime_type, run_type, status.
 
@@ -355,7 +356,14 @@ def list_runs(
     """
     if state.run_store is None:
         raise HTTPException(status_code=503, detail="run store not initialised")
-    return {"runs": state.run_store.list_runs(runtime_type=runtime_type, run_type=run_type, status=status, limit=limit)}
+    runs, count = state.run_store.list_runs(
+        runtime_type=runtime_type,
+        run_type=run_type,
+        status=status,
+        limit=limit,
+        offset=offset,
+    )
+    return {"runs": runs, "count": count}
 
 
 @app.get("/v2/runs/{run_id}")

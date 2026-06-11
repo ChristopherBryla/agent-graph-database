@@ -27,6 +27,7 @@ import logging
 import math
 import re
 import threading
+import time
 import traceback
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
@@ -105,6 +106,9 @@ class NodeOutcome:
     # True when inputs were coerced for storage (e.g. NaN->None or repr(...)).
     # Replay requires lossless JSON inputs.
     inputs_lossy: bool = False
+    # Epoch-second timestamps captured around node execution.
+    started_at: float | None = None
+    finished_at: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         safe_output = None
@@ -127,6 +131,8 @@ class NodeOutcome:
             "message": self.message,
             "inputs": safe_inputs,
             "inputs_lossy": self.inputs_lossy or inferred_inputs_lossy,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
         }
         if self.traceback is not None:
             d["traceback"] = self.traceback
@@ -409,6 +415,7 @@ class Manager:
             raise LookupError(f"component '{component_name}' is not registered")
 
         lro = LROCollector()
+        started_at = time.time()
         try:
             output = component.execute(
                 lro_collector=lro,
@@ -426,6 +433,8 @@ class Manager:
                 status="completed",
                 output=output or {},
                 inputs=resolved_inputs,
+                started_at=started_at,
+                finished_at=time.time(),
             )
         except Exception as exc:
             outcome = NodeOutcome(
@@ -435,6 +444,8 @@ class Manager:
                 message=f"{type(exc).__name__}: {exc}",
                 traceback=traceback.format_exc(),
                 inputs=resolved_inputs,
+                started_at=started_at,
+                finished_at=time.time(),
             )
         return outcome, lro.snapshot()
 
@@ -501,6 +512,7 @@ class Manager:
         def execute_one(node_id: str) -> NodeOutcome:
             cfg_node = nodes_by_id[node_id]
             component_name = cfg_node["component"]
+            started_at = time.time()
 
             # Debug filter
             if options.debug_components is not None and component_name not in options.debug_components:
@@ -509,6 +521,8 @@ class Manager:
                     component=component_name,
                     status="skipped",
                     message="not in X-Debug-Component-List",
+                    started_at=started_at,
+                    finished_at=time.time(),
                 )
 
             component = self._registry.get(component_name)
@@ -518,6 +532,8 @@ class Manager:
                     component=component_name,
                     status="skipped",
                     message=f"component '{component_name}' not registered",
+                    started_at=started_at,
+                    finished_at=time.time(),
                 )
 
             # Resolve inputs against the shared context
@@ -533,6 +549,8 @@ class Manager:
                     status="failed",
                     message=str(exc),
                     traceback=traceback.format_exc() if options.trace_failures else None,
+                    started_at=started_at,
+                    finished_at=time.time(),
                 )
 
             # Execute
@@ -553,6 +571,8 @@ class Manager:
                     status="completed",
                     output=output or {},
                     inputs=inputs,
+                    started_at=started_at,
+                    finished_at=time.time(),
                 )
             except Exception as exc:
                 return NodeOutcome(
@@ -562,6 +582,8 @@ class Manager:
                     message=f"{type(exc).__name__}: {exc}",
                     traceback=traceback.format_exc() if options.trace_failures else None,
                     inputs=inputs,
+                    started_at=started_at,
+                    finished_at=time.time(),
                 )
 
             # Honor wait_for_lros inside the worker: the node only counts as

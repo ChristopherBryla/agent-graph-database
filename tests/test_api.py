@@ -501,6 +501,18 @@ class TestRunPersistence:
             assert node["inputs"] is not None
             assert node["output"] is not None
 
+    def test_record_keeps_node_timings(self, client):
+        run_id = client.post(
+            "/v2/pipelines/scoring_v1/run", json={"source": "sample"}
+        ).json()["run_id"]
+        record = client.get(f"/v2/runs/{run_id}").json()
+        completed = [n for n in record["nodes"] if n["status"] == "completed"]
+        assert completed
+        for node in completed:
+            assert isinstance(node["started_at"], float)
+            assert isinstance(node["finished_at"], float)
+            assert node["finished_at"] >= node["started_at"]
+
     def test_unknown_run_id_returns_404(self, client):
         assert client.get("/v2/runs/no-such-run").status_code == 404
 
@@ -525,6 +537,40 @@ class TestRunPersistence:
         for _ in range(3):
             client.post("/v2/pipelines/scoring_v1/run", json={"source": "sample"})
         assert len(client.get("/v2/runs?limit=2").json()["runs"]) == 2
+
+    def test_list_runs_includes_count(self, client):
+        label = "team_count_check"
+        for _ in range(3):
+            client.post(
+                "/v2/pipelines/scoring_v1/run",
+                headers={"X-Run-Type": label},
+                json={"source": "sample"},
+            )
+        body = client.get(f"/v2/runs?run_type={label}&limit=2").json()
+        assert body["count"] >= 3
+        assert len(body["runs"]) == 2
+
+    def test_list_runs_supports_offset(self, client):
+        label = "team_offset_check"
+        created: list[str] = []
+        for _ in range(3):
+            run_id = client.post(
+                "/v2/pipelines/scoring_v1/run",
+                headers={"X-Run-Type": label},
+                json={"source": "sample"},
+            ).json()["run_id"]
+            created.append(run_id)
+
+        first = client.get(f"/v2/runs?run_type={label}&limit=1&offset=0").json()
+        second = client.get(f"/v2/runs?run_type={label}&limit=1&offset=1").json()
+
+        assert first["count"] >= 3
+        assert second["count"] == first["count"]
+        assert len(first["runs"]) == 1
+        assert len(second["runs"]) == 1
+        assert first["runs"][0]["run_id"] != second["runs"][0]["run_id"]
+        assert first["runs"][0]["run_id"] in created
+        assert second["runs"][0]["run_id"] in created
 
 
 # ---------------------------------------------------------------------------
