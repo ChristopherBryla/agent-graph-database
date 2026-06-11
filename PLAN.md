@@ -118,11 +118,15 @@ example pipeline.
 ## Milestone D — Historical replay / backfill (roadmap #4)
 
 ### D1. [big] Batch driver design
+Status: ✅ completed (June 11, 2026)
+
 Fan one pipeline over N time windows: request shape, concurrency (reuses the
 ready-set scheduler per run; cap concurrent runs), how N runs link to one
 backfill_id, partial-failure semantics. Design doc first (README section).
 
 ### D2. [small] DataProvider time windows
+Status: ✅ completed (June 11, 2026)
+
 Add optional `start`/`end` inputs to DataProviderAdapter (pass through to
 sample source as a filter; csv/database still NotImplementedError). Additive,
 contract-style validation, tests.

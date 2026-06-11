@@ -205,3 +205,64 @@ class TestRuntimeRouting:
         assert r2.json()["succeeded"] is True
         # Both runs should produce the same number of nodes
         assert len(r1.json()["nodes"]) == len(r2.json()["nodes"])
+
+
+# ---------------------------------------------------------------------------
+# 5. DataProvider time windows (D2)
+# ---------------------------------------------------------------------------
+
+class TestDataProviderWindows:
+    RT = "tmp_window_filter"
+
+    @pytest.fixture(autouse=True)
+    def _cleanup(self, client):
+        yield
+        client.delete(f"/v2/pipelines/{self.RT}/config")
+
+    @staticmethod
+    def _config():
+        return {
+            "nodes": [
+                {
+                    "id": "fetch",
+                    "component": "data_provider",
+                    "inputs": {
+                        "source": "sample",
+                        "start": "${request.start}",
+                        "end": "${request.end}",
+                    },
+                }
+            ]
+        }
+
+    def test_sample_window_filters_row_count(self, client):
+        assert client.put(f"/v2/pipelines/{self.RT}/config", json=self._config()).status_code == 200
+        r = client.post(
+            f"/v2/pipelines/{self.RT}/run",
+            json={"start": "2024-01-01T00:00:00Z", "end": "2024-01-11T00:00:00Z"},
+        )
+        assert r.status_code == 200
+        fetch = _nodes(r.json())["fetch"]
+        assert fetch["status"] == "completed"
+        assert fetch["output"]["row_count"] == 10
+        assert fetch["output"]["window"]["start"] == "2024-01-01T00:00:00Z"
+
+    def test_start_only_window_is_open_ended(self, client):
+        assert client.put(f"/v2/pipelines/{self.RT}/config", json=self._config()).status_code == 200
+        r = client.post(
+            f"/v2/pipelines/{self.RT}/run",
+            json={"start": "2024-01-11T00:00:00Z", "end": "2100-01-01T00:00:00Z"},
+        )
+        fetch = _nodes(r.json())["fetch"]
+        assert fetch["status"] == "completed"
+        assert fetch["output"]["row_count"] == 90
+
+    def test_invalid_window_fails_fetch_with_clear_message(self, client):
+        assert client.put(f"/v2/pipelines/{self.RT}/config", json=self._config()).status_code == 200
+        r = client.post(
+            f"/v2/pipelines/{self.RT}/run",
+            json={"start": "not-a-date", "end": "2024-01-11T00:00:00Z"},
+        )
+        fetch = _nodes(r.json())["fetch"]
+        assert fetch["status"] == "failed"
+        assert "start must be ISO8601" in fetch["message"]

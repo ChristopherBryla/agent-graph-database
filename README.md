@@ -167,6 +167,8 @@ Reference syntax inside `inputs:`:
 - `${<node_id>.output.<field>}` — output of a completed upstream node
 - A whole-string reference preserves the original type (list/dict/number);
   references embedded in longer strings are coerced to `str`.
+- DataProvider window inputs are supported on `source: sample`:
+  `start` / `end` (ISO8601, UTC) filter rows by synthetic sample timestamps.
 
 ## Parallel execution model
 
@@ -215,10 +217,11 @@ Reference syntax inside `inputs:`:
   Trained artifacts can be versioned (`save_model`) and loaded by name/version
   (`load_model`), and prediction pipelines can use `linear_predict` without
   retraining on every request.
-4. **Historical replay / backfill** — time-windowed data access in the
-   DataProvider (`start`/`end` alongside `entity_id`) plus a batch driver that
-   fans one pipeline out over N windows (naturally parallel under the
-   ready-set scheduler). Scheduled retraining falls out of this.
+4. **Historical replay / backfill** — in progress. DataProvider now supports
+  `start`/`end` windows for `sample` source (CSV/DB still pending); next is
+  the batch driver that fans one pipeline out over N windows (naturally
+  parallel under the ready-set scheduler). Scheduled retraining falls out of
+  this.
 5. **HTTP component adapter (language-agnostic components)** — a generic
    adapter that calls any model service behind an HTTP contract. This is what
    lets R (or any non-Python) models participate, unifies the in-process vs
@@ -308,6 +311,100 @@ versioned model selection.
 - Outgrowth: if teams need richer lifecycle/governance, keep this table as the
   local source of truth and add an MLflow synchronization adapter rather than
   replacing the lightweight default.
+
+## Backfill driver design (D1)
+
+This is the design for roadmap #4: fan one pipeline over N time windows and
+track the batch as one first-class object.
+
+### Goals
+
+- Run one `runtime_type` across many windows with bounded parallelism.
+- Reuse the existing per-run scheduler (`Manager.run`) unchanged.
+- Make batch lineage queryable: one `backfill_id` -> many `run_id`s.
+- Keep failure handling explicit and predictable.
+
+### API shape
+
+Proposed endpoints:
+
+- `POST /v2/backfills` -> create and start a backfill batch (async)
+- `GET /v2/backfills/{backfill_id}` -> batch status/summary
+- `GET /v2/backfills/{backfill_id}/runs` -> paginated child runs
+
+`POST /v2/backfills` request body:
+
+- `runtime_type`: string (pipeline to run)
+- `base_payload`: object (merged into every child run request)
+- `windows`: non-empty list of window objects:
+  - `window_id`: string (caller-stable id, e.g. `2024-01`)
+  - `start`: string (ISO8601)
+  - `end`: string (ISO8601)
+- `max_concurrent_runs`: int, optional (default 4, clamp 1..32)
+- `run_type`: optional (default `historical`)
+- `failure_mode`: optional enum:
+  - `continue` (default): keep scheduling remaining windows
+  - `stop`: stop scheduling new windows after first failed child run
+
+Child run payload shape (per window):
+
+- `request = {**base_payload, "start": <window.start>, "end": <window.end>, "window_id": <window.window_id>}`
+
+### Concurrency model
+
+- The batch driver is a run-level queue/worker pool only.
+- Each worker launches one normal pipeline run for one window.
+- Inside each child run, the existing ready-set node scheduler is unchanged.
+- Effective parallelism is two-tiered by design:
+  - run-level: `max_concurrent_runs`
+  - node-level: `MANAGER_MAX_WORKERS`
+
+### Persistence and linkage
+
+Add a new `backfills` table:
+
+- `backfill_id` TEXT PRIMARY KEY
+- `runtime_type` TEXT NOT NULL
+- `status` TEXT NOT NULL (`running`, `completed`, `completed_with_errors`, `failed`, `canceled`)
+- `run_type` TEXT NOT NULL
+- `failure_mode` TEXT NOT NULL
+- `max_concurrent_runs` INTEGER NOT NULL
+- `total_windows` INTEGER NOT NULL
+- `succeeded_windows` INTEGER NOT NULL DEFAULT 0
+- `failed_windows` INTEGER NOT NULL DEFAULT 0
+- `started_at` TEXT NOT NULL
+- `finished_at` TEXT
+- `error` TEXT
+
+Extend `runs` with additive nullable columns:
+
+- `backfill_id` TEXT NULL
+- `backfill_window_id` TEXT NULL
+- `window_start` TEXT NULL
+- `window_end` TEXT NULL
+
+This keeps existing run APIs intact while enabling direct filtering by
+`backfill_id` and window identity.
+
+### Partial-failure semantics
+
+- Child run success/failure comes from existing run completion state.
+- Batch final status rules:
+  - all child runs succeed -> `completed`
+  - at least one fails, at least one succeeds -> `completed_with_errors`
+  - all fail -> `failed`
+- With `failure_mode=continue`, process all windows and classify at end.
+- With `failure_mode=stop`, stop scheduling after first failure; already
+  running child runs are allowed to finish.
+
+### Operational notes
+
+- Idempotency (optional follow-up): accept `client_request_id` on
+  `POST /v2/backfills` and dedupe against active/recent batches.
+- Cancellation (optional follow-up): `POST /v2/backfills/{id}/cancel` sets
+  batch to `canceled` and stops scheduling unsent windows.
+- This design intentionally does not change component contracts; D2 is the
+  additive DataProvider `start`/`end` support needed by windowed runs.
 
 ## API surface
 

@@ -42,6 +42,8 @@ class DataProviderAdapter:
         node_id: str,
         source: str = "sample",
         entity_id: str | None = None,
+        start: str | None = None,
+        end: str | None = None,
         data: list[dict[str, float]] | None = None,
         targets: list[float] | None = None,
     ) -> dict[str, Any]:
@@ -55,7 +57,12 @@ class DataProviderAdapter:
                 result_data = data
                 result_targets = list(targets)
             else:
-                result_data, result_targets = self._provider.get_training_data(source, entity_id=entity_id)
+                result_data, result_targets = self._provider.get_training_data(
+                    source,
+                    entity_id=entity_id,
+                    start=start,
+                    end=end,
+                )
                 result_targets = list(result_targets)
             lro_collector.complete(op_id)
         except Exception as exc:
@@ -66,6 +73,7 @@ class DataProviderAdapter:
             "data": result_data,
             "targets": result_targets,
             "row_count": len(result_data),
+            "window": {"start": start, "end": end},
         }
 
 
