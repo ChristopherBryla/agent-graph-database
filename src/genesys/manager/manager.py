@@ -458,6 +458,7 @@ class Manager:
         runtime_type: str,
         request_payload: dict[str, Any],
         options: RunOptions | None = None,
+        run_id: str | None = None,
     ) -> RunResult:
         options = options or RunOptions()
         if not RUN_TYPE_RE.match(options.run_type):
@@ -503,7 +504,7 @@ class Manager:
         # node (e.g. save_results) tag persisted data with its classification.
         run_context: dict[str, Any] = {
             "request": request_payload,
-            "run": {"run_type": options.run_type},
+            "run": {"run_type": options.run_type, "run_id": run_id},
         }
         outcomes: dict[str, NodeOutcome] = {}
         ctx_lock = threading.Lock()

@@ -20,7 +20,10 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from genesys.manager.adapters import (
     DataProviderAdapter,
     InMemorySaveResultsAdapter,
+    LinearPredictAdapter,
     LinearRegressionAdapter,
+    LoadModelAdapter,
+    SaveModelAdapter,
 )
 from genesys.manager.manager import (
     DEFAULT_RUN_TYPE,
@@ -32,6 +35,7 @@ from genesys.manager.manager import (
     validate_pipeline_config,
 )
 from genesys.storage.run_store import RunStore
+from genesys.storage.model_registry_store import ModelRegistryStore
 
 
 logger = logging.getLogger(__name__)
@@ -50,8 +54,12 @@ MANAGER_MAX_WORKERS = int(os.getenv("MANAGER_MAX_WORKERS", "8"))
 # SQLite file recording every pipeline run (see genesys.storage.run_store).
 RUNS_DB_PATH = os.getenv("GENESYS_RUNS_DB", "data/genesys_runs.db")
 
+# SQLite + blob paths for lightweight model registry (roadmap #3).
+MODELS_DB_PATH = os.getenv("GENESYS_MODELS_DB", "data/genesys_models.db")
+MODEL_BLOBS_PATH = os.getenv("GENESYS_MODEL_BLOBS_DIR", "data/blobs")
+
 # Built-in infrastructure components — hidden from the pipeline node dropdown.
-_INFRASTRUCTURE = {"data_provider", "save_results"}
+_INFRASTRUCTURE = {"data_provider", "save_results", "save_model", "load_model", "linear_predict"}
 
 
 # ---------------------------------------------------------------------------
@@ -176,8 +184,12 @@ state = _AppState()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     orch = Manager(config_dir=PIPELINE_CONFIGS_DIR, max_workers=MANAGER_MAX_WORKERS)
+    model_registry = ModelRegistryStore(db_path=MODELS_DB_PATH, blob_path=MODEL_BLOBS_PATH)
     orch.register("data_provider", DataProviderAdapter())
     orch.register("linear_regression", LinearRegressionAdapter())
+    orch.register("save_model", SaveModelAdapter(model_registry))
+    orch.register("load_model", LoadModelAdapter(model_registry))
+    orch.register("linear_predict", LinearPredictAdapter())
     save_adapter = InMemorySaveResultsAdapter()
     orch.register("save_results", save_adapter)
     plugins = _load_plugins(orch)
@@ -313,7 +325,7 @@ async def run_v2(
 
         def _execute_in_background() -> None:
             try:
-                result = manager.run(runtime_type, payload, options)
+                result = manager.run(runtime_type, payload, options, run_id=run_id)
                 run_store.complete_run(run_id, result.to_dict())
             except Exception as exc:  # infra failure — record it for the poller
                 run_store.fail_run(run_id, f"{type(exc).__name__}: {exc}")
@@ -327,7 +339,7 @@ async def run_v2(
     try:
         # Run the (synchronous, potentially long) pipeline in a worker thread so
         # the event loop stays free to serve other requests (incl. /health).
-        result = await run_in_threadpool(state.manager.run, runtime_type, payload, options)
+        result = await run_in_threadpool(state.manager.run, runtime_type, payload, options, run_id)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except ContractValidationError as exc:

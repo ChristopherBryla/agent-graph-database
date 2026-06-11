@@ -1,0 +1,24 @@
+# scoring_predict — load a saved model version and predict without retraining.
+
+runtime_type: scoring_predict
+
+contract:
+  - name: model_name
+    type: str
+    required: true
+  - name: data
+    type: list
+    required: true
+
+nodes:
+  - id: load
+    component: load_model
+    inputs:
+      name: "${request.model_name}"
+
+  - id: predict
+    component: linear_predict
+    depends_on: [load]
+    inputs:
+      model: "${load.output.model}"
+      data: "${request.data}"

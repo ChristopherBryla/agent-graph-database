@@ -692,3 +692,119 @@ class TestReplayEndpoint:
         r = client.post(f"/v2/runs/{parent_run_id}/replay/predict")
         assert r.status_code == 422
         assert "not registered" in r.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Model lifecycle (C2) — save_model / load_model / linear_predict
+# ---------------------------------------------------------------------------
+
+class TestModelLifecycle:
+    RT = "tmp_model_registry"
+
+    @pytest.fixture(autouse=True)
+    def _cleanup(self, client):
+        yield
+        client.delete(f"/v2/pipelines/{self.RT}/config")
+
+    @staticmethod
+    def _config():
+        return {
+            "nodes": [
+                {
+                    "id": "fetch",
+                    "component": "data_provider",
+                    "inputs": {
+                        "source": "passthrough",
+                        "data": "${request.train_data}",
+                        "targets": "${request.targets}",
+                    },
+                },
+                {
+                    "id": "train",
+                    "component": "linear_regression",
+                    "depends_on": ["fetch"],
+                    "inputs": {
+                        "data": "${fetch.output.data}",
+                        "targets": "${fetch.output.targets}",
+                        "learning_rate": 0.01,
+                        "epochs": 50,
+                    },
+                },
+                {
+                    "id": "save",
+                    "component": "save_model",
+                    "depends_on": ["train"],
+                    "inputs": {
+                        "name": "${request.model_name}",
+                        "artifact": {
+                            "weights": "${train.output.weights}",
+                            "bias": "${train.output.bias}",
+                        },
+                        "created_by_run_id": "${run.run_id}",
+                        "metrics": {"epochs": "${train.output.epochs}"},
+                    },
+                },
+                {
+                    "id": "load",
+                    "component": "load_model",
+                    "depends_on": ["save"],
+                    "inputs": {
+                        "name": "${save.output.name}",
+                        "version": "${save.output.version}",
+                    },
+                },
+                {
+                    "id": "predict",
+                    "component": "linear_predict",
+                    "depends_on": ["load"],
+                    "inputs": {
+                        "model": "${load.output.model}",
+                        "data": "${request.predict_data}",
+                    },
+                },
+            ]
+        }
+
+    @staticmethod
+    def _payload(model_name: str):
+        return {
+            "model_name": model_name,
+            "train_data": [
+                {"x1": 1.0, "x2": 2.0, "x3": 3.0, "x4": 4.0},
+                {"x1": 2.0, "x2": 3.0, "x3": 4.0, "x4": 5.0},
+                {"x1": 3.0, "x2": 4.0, "x3": 5.0, "x4": 6.0},
+            ],
+            "targets": [10.0, 14.0, 18.0],
+            "predict_data": [
+                {"x1": 4.0, "x2": 5.0, "x3": 6.0, "x4": 7.0},
+                {"x1": 5.0, "x2": 6.0, "x3": 7.0, "x4": 8.0},
+            ],
+        }
+
+    def test_save_load_predict_flow(self, client):
+        assert client.put(f"/v2/pipelines/{self.RT}/config", json=self._config()).status_code == 200
+        r = client.post(f"/v2/pipelines/{self.RT}/run", json=self._payload("tmp_model_lifecycle_a"))
+        assert r.status_code == 200
+        nodes = {n["node_id"]: n for n in r.json()["nodes"]}
+        assert nodes["save"]["status"] == "completed"
+        assert nodes["load"]["status"] == "completed"
+        assert nodes["predict"]["status"] == "completed"
+        assert nodes["save"]["output"]["version"] == 1
+        assert nodes["load"]["output"]["version"] == 1
+        assert len(nodes["predict"]["output"]["predictions"]) == 2
+
+    def test_model_version_increments(self, client):
+        assert client.put(f"/v2/pipelines/{self.RT}/config", json=self._config()).status_code == 200
+        first = client.post(
+            f"/v2/pipelines/{self.RT}/run",
+            json=self._payload("tmp_model_lifecycle_b"),
+        ).json()
+        second = client.post(
+            f"/v2/pipelines/{self.RT}/run",
+            json=self._payload("tmp_model_lifecycle_b"),
+        ).json()
+
+        first_nodes = {n["node_id"]: n for n in first["nodes"]}
+        second_nodes = {n["node_id"]: n for n in second["nodes"]}
+        assert first_nodes["save"]["output"]["version"] == 1
+        assert second_nodes["save"]["output"]["version"] == 2

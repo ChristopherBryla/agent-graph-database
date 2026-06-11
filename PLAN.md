@@ -99,12 +99,16 @@ Add `offset` param to RunStore.list_runs + endpoint, and return
 ## Milestone C — Model lifecycle: train/predict split (roadmap #3)
 
 ### C1. [big] Design the minimal model registry
+Status: ✅ completed (June 11, 2026)
+
 Decide schema + flow before any code: a `models` table (model_id, name,
 version, blob pointer via existing BlobStore/HybridStore, created_by_run_id).
 Keep it lite — versioned save/load only; MLflow integration if outgrown.
 Output of this task is a short design section in README, not code.
 
 ### C2. [small] Implement per C1's written design
+Status: ✅ completed (June 11, 2026)
+
 Only after C1 lands in README. SaveModelAdapter + LoadModelAdapter following
 src/genesys/manager/adapters.py patterns, plus a `scoring_predict.yaml`
 example pipeline.

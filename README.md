@@ -96,6 +96,9 @@ Manager / orchestrator (src/genesys/manager/manager.py)
 Components (looked up by name in a registry)
       ├─ data_provider      → DataProviderAdapter → DataProvider
       ├─ linear_regression  → LinearRegressionAdapter → LinearRegression
+  ├─ save_model         → SaveModelAdapter → ModelRegistryStore
+  ├─ load_model         → LoadModelAdapter → ModelRegistryStore
+  ├─ linear_predict     → LinearPredictAdapter
       ├─ save_results       → InMemorySaveResultsAdapter
       └─ plugins/*.py       → user components, auto-wrapped at load time
 ```
@@ -208,9 +211,10 @@ Reference syntax inside `inputs:`:
    diff its output against what that run produced. This is the data
    scientist's daily driver; `X-Debug-Component-List` and plugin hot-reload
    are the existing building blocks.
-3. **Model lifecycle: separate train from predict** — persist trained model
-   artifacts with a version (minimal, opinionated — see Positioning), then add
-   predict pipelines that load a stored model instead of retraining every call.
+3. **Model lifecycle: separate train from predict** — ✅ minimal v1 done.
+  Trained artifacts can be versioned (`save_model`) and loaded by name/version
+  (`load_model`), and prediction pipelines can use `linear_predict` without
+  retraining on every request.
 4. **Historical replay / backfill** — time-windowed data access in the
    DataProvider (`start`/`end` alongside `entity_id`) plus a batch driver that
    fans one pipeline out over N windows (naturally parallel under the
@@ -231,6 +235,79 @@ Reference syntax inside `inputs:`:
    execution before multi-tenant deployment.
 8. **Real data sources** — implement the `csv` and `database` DataProvider
    sources (currently `NotImplementedError`).
+
+## Model registry design (C1)
+
+This is the intentionally small, opinionated design for roadmap #3 (separate
+train from predict) so C2 can implement it directly.
+
+### Goals
+
+- Versioned save/load of trained model artifacts.
+- Keep the developer contract simple for data scientists.
+- Reuse existing storage primitives (`BlobStore` / `HybridStore`) and run
+  lineage (`run_id`) from the run store.
+
+### Non-goals
+
+- No experiment tracking UI.
+- No model stage workflows (staging/production approvals).
+- No lineage graph explorer.
+
+### Schema
+
+Create a `models` table in SQLite with one row per immutable model version:
+
+- `model_id` TEXT PRIMARY KEY (uuid)
+- `name` TEXT NOT NULL (logical model family, e.g. `churn_lr`)
+- `version` INTEGER NOT NULL (monotonic per `name`, starts at 1)
+- `blob_key` TEXT NOT NULL (pointer to serialized artifact in BlobStore/HybridStore)
+- `metrics` TEXT NULL (JSON; optional summary metrics from training)
+- `created_by_run_id` TEXT NOT NULL (run that produced this model)
+- `created_at` TEXT NOT NULL (UTC ISO8601)
+
+Constraints/indexes:
+
+- `UNIQUE(name, version)`
+- index on `(name, created_at DESC)` for latest-version lookups
+- optional index on `created_by_run_id` for traceability queries
+
+### Component contract (for C2)
+
+Add two adapters following existing adapter patterns:
+
+- `SaveModelAdapter`
+  - Inputs: `name`, `artifact`, optional `metrics`
+  - Behavior: serialize `artifact`, write blob, allocate next `version` for
+    `name`, insert row into `models`, return `model_ref`
+  - Output shape:
+    - `model_id`, `name`, `version`, `blob_key`, `created_by_run_id`
+
+- `LoadModelAdapter`
+  - Inputs: `name` + optional `version`
+  - Behavior: if `version` missing, load latest version for `name`; fetch blob;
+    deserialize and return the artifact
+  - Output shape:
+    - `model` (deserialized artifact), plus `model_id`, `name`, `version`
+
+`created_by_run_id` source: use the current run identifier so every model
+version is linked to the exact training run that produced it.
+
+### Pipeline flow split
+
+- **Training pipeline** produces weights/artifact then calls `save_model`.
+- **Predict pipeline** calls `load_model` first, then scoring component uses
+  loaded artifact for inference.
+
+This removes retraining from online prediction paths and gives deterministic,
+versioned model selection.
+
+### Migration and outgrowth path
+
+- Migration: additive table creation; no changes to existing run schema.
+- Outgrowth: if teams need richer lifecycle/governance, keep this table as the
+  local source of truth and add an MLflow synchronization adapter rather than
+  replacing the lightweight default.
 
 ## API surface
 
@@ -277,6 +354,8 @@ Environment variables:
 - `PLUGINS_DIR` (default `plugins`)
 - `MANAGER_MAX_WORKERS` (default `8`) — per-level thread cap
 - `GENESYS_RUNS_DB` (default `data/genesys_runs.db`) — SQLite file recording every run
+- `GENESYS_MODELS_DB` (default `data/genesys_models.db`) — SQLite file for model metadata/version rows
+- `GENESYS_MODEL_BLOBS_DIR` (default `data/blobs`) — blob directory for serialized model artifacts
 - `GENESYS_API_KEY` (unset by default) — see "Live editing & the API key gate"
 
 ## Live editing & the API key gate

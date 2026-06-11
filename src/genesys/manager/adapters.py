@@ -14,12 +14,14 @@ Each adapter also demonstrates LRO usage so you can see what shows up in the
 
 from __future__ import annotations
 
+import pickle
 import threading
 from typing import Any
 
 from genesys.contract.data_contract import ContractViolationError
 from genesys.dataprovider.main_data_provider import DataProvider
 from genesys.manager.lro import LROCollector
+from genesys.storage.model_registry_store import ModelRegistryStore
 from sample.ml_model.ml_sample_model1 import LinearRegression
 
 
@@ -167,4 +169,134 @@ class InMemorySaveResultsAdapter:
         return {
             "label": label,
             "record_count": len(self.records),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Model lifecycle adapters
+# ---------------------------------------------------------------------------
+
+class SaveModelAdapter:
+    """Save a versioned model artifact and return its model reference."""
+
+    def __init__(self, registry: ModelRegistryStore) -> None:
+        self._registry = registry
+
+    def execute(
+        self,
+        *,
+        lro_collector: LROCollector,
+        node_id: str,
+        name: str,
+        artifact: Any,
+        created_by_run_id: str,
+        metrics: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if not created_by_run_id:
+            raise ValueError("save_model requires 'created_by_run_id' (pass ${run.run_id})")
+
+        op_id = lro_collector.start(
+            node_id=node_id, component="save_model", kind="persist", ref=name,
+        )
+        try:
+            metadata = self._registry.save_model(
+                name=name,
+                artifact_bytes=pickle.dumps(artifact),
+                created_by_run_id=created_by_run_id,
+                metrics=metrics,
+            )
+            lro_collector.complete(op_id)
+        except Exception as exc:
+            lro_collector.fail(op_id, str(exc))
+            raise
+
+        return {
+            "model_id": metadata["model_id"],
+            "name": metadata["name"],
+            "version": metadata["version"],
+            "blob_key": metadata["blob_key"],
+            "created_by_run_id": metadata["created_by_run_id"],
+        }
+
+
+class LoadModelAdapter:
+    """Load a model artifact by name (and optional version)."""
+
+    def __init__(self, registry: ModelRegistryStore) -> None:
+        self._registry = registry
+
+    def execute(
+        self,
+        *,
+        lro_collector: LROCollector,
+        node_id: str,
+        name: str,
+        version: int | None = None,
+    ) -> dict[str, Any]:
+        ref = f"{name}:{version}" if version is not None else f"{name}:latest"
+        op_id = lro_collector.start(
+            node_id=node_id, component="load_model", kind="load", ref=ref,
+        )
+        try:
+            record = self._registry.load_model(name=name, version=version)
+            if record is None:
+                raise FileNotFoundError(f"no model found for name='{name}' version='{version}'")
+            model = pickle.loads(record["artifact_bytes"])
+            lro_collector.complete(op_id)
+        except Exception as exc:
+            lro_collector.fail(op_id, str(exc))
+            raise
+
+        return {
+            "model_id": record["model_id"],
+            "name": record["name"],
+            "version": int(record["version"]),
+            "model": model,
+        }
+
+
+class LinearPredictAdapter:
+    """Generate predictions from a serialized linear regression artifact."""
+
+    def execute(
+        self,
+        *,
+        lro_collector: LROCollector,
+        node_id: str,
+        model: dict[str, Any],
+        data: list[dict[str, float]],
+    ) -> dict[str, Any]:
+        op_id = lro_collector.start(
+            node_id=node_id, component="linear_predict", kind="predict", ref=f"rows={len(data)}",
+        )
+        try:
+            weights = model.get("weights")
+            bias = model.get("bias")
+            if not isinstance(weights, list) or len(weights) != 4:
+                raise ValueError("linear_predict expected model.weights as a list of 4 numbers")
+            if bias is None:
+                raise ValueError("linear_predict expected model.bias")
+
+            lr = LinearRegression()
+            lr.weights = [float(w) for w in weights]
+            lr.bias = float(bias)
+
+            violations = lr.contract.validate_batch(data)
+            if violations:
+                flat = [msg for vs in violations.values() for msg in vs]
+                raise ContractViolationError(lr.contract.model_name, flat)
+
+            field_names = [f.name for f in lr.contract.fields]
+            predictions = [
+                float(lr.predict(*(float(row[k]) for k in field_names)))
+                for row in data
+            ]
+            lro_collector.complete(op_id)
+        except Exception as exc:
+            lro_collector.fail(op_id, str(exc))
+            raise
+
+        return {
+            "predictions": predictions,
+            "row_count": len(predictions),
         }

@@ -14,3 +14,14 @@ os.environ.setdefault(
     "GENESYS_RUNS_DB",
     os.path.join(tempfile.mkdtemp(prefix="genesys_test_"), "runs.db"),
 )
+
+# Keep model registry artifacts test-local as well.
+_models_tmp = tempfile.mkdtemp(prefix="genesys_models_test_")
+os.environ.setdefault(
+    "GENESYS_MODELS_DB",
+    os.path.join(_models_tmp, "models.db"),
+)
+os.environ.setdefault(
+    "GENESYS_MODEL_BLOBS_DIR",
+    os.path.join(_models_tmp, "blobs"),
+)
