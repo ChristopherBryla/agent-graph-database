@@ -795,6 +795,66 @@ class TestBackfills:
 
 
 # ---------------------------------------------------------------------------
+# Monitoring stats — GET /v2/runtimes/{runtime_type}/stats
+# ---------------------------------------------------------------------------
+
+class TestRuntimeStats:
+    def test_stats_aggregates_counts_and_failure_rate_for_run_type(self, client):
+        label = "tmp_stats_summary"
+        for _ in range(2):
+            ok = client.post(
+                "/v2/pipelines/scoring_v1/run",
+                headers={"X-Run-Type": label},
+                json={"source": "sample"},
+            )
+            assert ok.status_code == 200
+
+        bad = client.post(
+            "/v2/pipelines/scoring_v1/run",
+            headers={"X-Run-Type": label},
+            json={},
+        )
+        assert bad.status_code == 200
+        assert bad.json()["succeeded"] is False
+
+        stats = client.get(
+            f"/v2/runtimes/scoring_v1/stats?run_type={label}&limit_runs=10"
+        )
+        assert stats.status_code == 200
+        body = stats.json()
+        assert body["runtime_type"] == "scoring_v1"
+        assert body["runs"]["total"] == 3
+        assert body["runs"]["completed"] == 3
+        assert body["runs"]["failed"] == 1
+        assert body["runs"]["by_run_type"] == {label: 3}
+        assert abs(body["runs"]["failure_rate"] - (1 / 3)) < 1e-6
+        assert any(n["node_id"] == "fetch" for n in body["node_durations"])
+
+    def test_stats_since_window_can_exclude_runs(self, client):
+        label = "tmp_stats_since"
+        run = client.post(
+            "/v2/pipelines/scoring_v1/run",
+            headers={"X-Run-Type": label},
+            json={"source": "sample"},
+        )
+        assert run.status_code == 200
+
+        stats = client.get(
+            "/v2/runtimes/scoring_v1/stats"
+            f"?run_type={label}&since=2100-01-01T00:00:00Z&limit_runs=10"
+        )
+        assert stats.status_code == 200
+        body = stats.json()
+        assert body["runs"]["total"] == 0
+        assert body["node_durations"] == []
+
+    def test_stats_rejects_invalid_since(self, client):
+        r = client.get("/v2/runtimes/scoring_v1/stats?since=not-a-date")
+        assert r.status_code == 422
+        assert "since must be ISO8601" in r.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
 # Node replay + output diff — POST /v2/runs/{run_id}/replay/{node_id}
 # ---------------------------------------------------------------------------
 
@@ -1040,3 +1100,223 @@ class TestModelLifecycle:
         second_nodes = {n["node_id"]: n for n in second["nodes"]}
         assert first_nodes["save"]["output"]["version"] == 1
         assert second_nodes["save"]["output"]["version"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Schedules CRUD (F4)
+# ---------------------------------------------------------------------------
+
+class TestSchedules:
+    """Test scheduler endpoints and daemon execution."""
+
+    RT = "tmp_scheduler_test"
+    PAYLOAD = {"source": "sample"}
+
+    @pytest.fixture(autouse=True)
+    def _cleanup(self, client):
+        yield
+        client.delete(f"/v2/pipelines/{self.RT}/config")
+
+    def test_create_schedule_returns_201(self, client):
+        r = client.post(
+            "/v2/schedules",
+            json={
+                "runtime_type": self.RT,
+                "payload": self.PAYLOAD,
+                "run_type": "scheduled",
+                "interval_seconds": 60,
+                "overlap_policy": "skip",
+            },
+        )
+        assert r.status_code == 201
+        body = r.json()
+        assert body["schedule_id"]
+        assert body["runtime_type"] == self.RT
+        assert body["enabled"] is True
+        assert body["interval_seconds"] == 60
+
+    def test_create_schedule_clamps_interval(self, client):
+        r = client.post(
+            "/v2/schedules",
+            json={
+                "runtime_type": self.RT,
+                "payload": self.PAYLOAD,
+                "interval_seconds": 10,  # Too small
+            },
+        )
+        assert r.status_code == 201
+        assert r.json()["interval_seconds"] == 30  # Clamped to min
+
+    def test_list_schedules_returns_200(self, client):
+        r = client.post(
+            "/v2/schedules",
+            json={"runtime_type": self.RT, "payload": self.PAYLOAD},
+        )
+        schedule_id = r.json()["schedule_id"]
+
+        r = client.get("/v2/schedules")
+        assert r.status_code == 200
+        schedules = r.json()
+        ids = {s["schedule_id"] for s in schedules}
+        assert schedule_id in ids
+
+    def test_get_schedule_returns_200(self, client):
+        r = client.post(
+            "/v2/schedules",
+            json={"runtime_type": self.RT, "payload": self.PAYLOAD},
+        )
+        schedule_id = r.json()["schedule_id"]
+
+        r = client.get(f"/v2/schedules/{schedule_id}")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["schedule_id"] == schedule_id
+        assert body["runtime_type"] == self.RT
+
+    def test_get_schedule_returns_404_when_missing(self, client):
+        r = client.get("/v2/schedules/no-such-schedule")
+        assert r.status_code == 404
+
+    def test_update_schedule_returns_200(self, client):
+        r = client.post(
+            "/v2/schedules",
+            json={"runtime_type": self.RT, "payload": self.PAYLOAD},
+        )
+        schedule_id = r.json()["schedule_id"]
+
+        r = client.put(
+            f"/v2/schedules/{schedule_id}",
+            json={"interval_seconds": 120, "enabled": False},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["interval_seconds"] == 120
+        assert body["enabled"] is False
+
+    def test_delete_schedule_returns_204(self, client):
+        r = client.post(
+            "/v2/schedules",
+            json={"runtime_type": self.RT, "payload": self.PAYLOAD},
+        )
+        schedule_id = r.json()["schedule_id"]
+
+        r = client.delete(f"/v2/schedules/{schedule_id}")
+        assert r.status_code == 204
+
+        # Verify it's gone
+        r = client.get(f"/v2/schedules/{schedule_id}")
+        assert r.status_code == 404
+
+    def test_run_now_executes_immediately(self, client):
+        # First set up a pipeline
+        assert client.put(
+            f"/v2/pipelines/{self.RT}/config",
+            json={
+                "nodes": [
+                    {"id": "fetch", "component": "data_provider", "inputs": {"path": ""}},
+                    {
+                        "id": "train",
+                        "component": "linear_regression",
+                        "depends_on": ["fetch"],
+                        "inputs": {"data": "${fetch.output.data}"},
+                    },
+                ]
+            },
+        ).status_code == 200
+
+        r = client.post(
+            "/v2/schedules",
+            json={
+                "runtime_type": self.RT,
+                "payload": self.PAYLOAD,
+                "run_type": "immediate_test",
+            },
+        )
+        schedule_id = r.json()["schedule_id"]
+
+        r = client.post(f"/v2/schedules/{schedule_id}/run-now")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["run_id"]
+        assert body["status"] == "completed"
+        assert body["run_type"] == "immediate_test"
+
+    def test_daemon_executes_due_schedule(self, client):
+        # Set up pipeline
+        assert client.put(
+            f"/v2/pipelines/{self.RT}/config",
+            json={
+                "nodes": [
+                    {"id": "fetch", "component": "data_provider", "inputs": {"path": ""}},
+                    {
+                        "id": "train",
+                        "component": "linear_regression",
+                        "depends_on": ["fetch"],
+                        "inputs": {"data": "${fetch.output.data}"},
+                    },
+                ]
+            },
+        ).status_code == 200
+
+        # Create schedule with short interval
+        r = client.post(
+            "/v2/schedules",
+            json={
+                "runtime_type": self.RT,
+                "payload": self.PAYLOAD,
+                "run_type": "daemon_scheduled",
+                "interval_seconds": 30,
+                "overlap_policy": "skip",
+            },
+        )
+        schedule_id = r.json()["schedule_id"]
+
+        # Wait for daemon to pick it up (usually < 2 seconds)
+        for _ in range(40):
+            schedule = client.get(f"/v2/schedules/{schedule_id}").json()
+            if schedule.get("last_run_id"):
+                break
+            time.sleep(0.05)
+
+        schedule = client.get(f"/v2/schedules/{schedule_id}").json()
+        assert schedule.get("last_run_id") is not None
+        run = client.get(f"/v2/runs/{schedule['last_run_id']}").json()
+        assert run["status"] == "completed"
+        assert run["run_type"] == "daemon_scheduled"
+
+    def test_overlap_policy_skip_prevents_concurrent_runs(self, client):
+        # Set up pipeline
+        assert client.put(
+            f"/v2/pipelines/{self.RT}/config",
+            json={
+                "nodes": [
+                    {"id": "fetch", "component": "data_provider", "inputs": {"path": ""}},
+                ]
+            },
+        ).status_code == 200
+
+        # Create schedule with skip policy
+        r = client.post(
+            "/v2/schedules",
+            json={
+                "runtime_type": self.RT,
+                "payload": self.PAYLOAD,
+                "interval_seconds": 30,
+                "overlap_policy": "skip",
+            },
+        )
+        schedule_id = r.json()["schedule_id"]
+
+        # Trigger first run
+        client.post(f"/v2/schedules/{schedule_id}/run-now")
+
+        # Wait for daemon and check that runs are tracked
+        for _ in range(40):
+            schedule = client.get(f"/v2/schedules/{schedule_id}").json()
+            if schedule.get("last_run_id"):
+                break
+            time.sleep(0.05)
+
+        schedule = client.get(f"/v2/schedules/{schedule_id}").json()
+        assert schedule.get("last_run_id") is not None
+

@@ -217,20 +217,23 @@ Reference syntax inside `inputs:`:
   Trained artifacts can be versioned (`save_model`) and loaded by name/version
   (`load_model`), and prediction pipelines can use `linear_predict` without
   retraining on every request.
-4. **Historical replay / backfill** — in progress. DataProvider now supports
-  `start`/`end` windows for `sample` source (CSV/DB still pending); next is
-  the batch driver that fans one pipeline out over N windows (naturally
-  parallel under the ready-set scheduler). Scheduled retraining falls out of
-  this.
+4. **Historical replay / backfill** — ✅ done (v1). DataProvider supports
+  `start`/`end` windows for `sample` source, and backfill APIs are live:
+  `POST /v2/backfills`, `GET /v2/backfills/{backfill_id}`, and
+  `GET /v2/backfills/{backfill_id}/runs`. Batches fan one pipeline over
+  many windows with bounded run-level concurrency and explicit
+  `continue|stop` failure handling, while child runs reuse the existing
+  ready-set node scheduler.
 5. **HTTP component adapter (language-agnostic components)** — a generic
    adapter that calls any model service behind an HTTP contract. This is what
    lets R (or any non-Python) models participate, unifies the in-process vs
    docker-compose (ports 8001/8002) split, and sidesteps the GIL since model
    calls become I/O-bound.
-6. **Monitoring** — replace `print` with structured logging, record per-node
-   timings in the run record (LRO durations already capture most of it), add a
-   run-history endpoint. Drift/model-performance tracking comes after run
-   history exists.
+6. **Monitoring** — ✅ v1 done. Structured logging is in place, per-node
+  timings are recorded, and `/v2/runtimes/{runtime_type}/stats` provides
+  run-status totals, failure rate, run-type breakdown, and per-node
+  duration aggregates (avg/p95). Drift/model-performance tracking is the
+  next monitoring layer.
 7. **Security** — partially done: `GENESYS_API_KEY` gates all mutating
    endpoints and production runs (see "Live editing & the API key gate").
    Still open: per-user/team identity (so run_type labels and component
@@ -314,8 +317,8 @@ versioned model selection.
 
 ## Backfill driver design (D1)
 
-This is the design for roadmap #4: fan one pipeline over N time windows and
-track the batch as one first-class object.
+This is the implemented design for roadmap #4: one pipeline can run over N
+time windows while the batch is tracked as one first-class object.
 
 ### Goals
 
@@ -326,7 +329,7 @@ track the batch as one first-class object.
 
 ### API shape
 
-Proposed endpoints:
+Endpoints:
 
 - `POST /v2/backfills` -> create and start a backfill batch (async)
 - `GET /v2/backfills/{backfill_id}` -> batch status/summary
@@ -399,12 +402,129 @@ This keeps existing run APIs intact while enabling direct filtering by
 
 ### Operational notes
 
-- Idempotency (optional follow-up): accept `client_request_id` on
+- Idempotency is still an optional follow-up: accept `client_request_id` on
   `POST /v2/backfills` and dedupe against active/recent batches.
-- Cancellation (optional follow-up): `POST /v2/backfills/{id}/cancel` sets
-  batch to `canceled` and stops scheduling unsent windows.
-- This design intentionally does not change component contracts; D2 is the
-  additive DataProvider `start`/`end` support needed by windowed runs.
+- Cancellation is still an optional follow-up: `POST /v2/backfills/{id}/cancel`
+  would set batch to `canceled` and stop scheduling unsent windows.
+- Component contracts are unchanged; windowing is additive via DataProvider
+  `start`/`end` inputs.
+
+## Monitoring summary design (F1)
+
+This is the implemented design for roadmap #6 monitoring v1: a read-only
+runtime summary over recent runs.
+
+### Endpoint
+
+- `GET /v2/runtimes/{runtime_type}/stats`
+
+Query params:
+
+- `run_type` optional: filter to one run label (same slug rules as run API)
+- `since` optional: ISO8601 lower bound on run `started_at`
+- `limit_runs` optional: cap selected runs (default 200, clamp 1..1000)
+
+### Window semantics
+
+- Selection is always newest-first by `started_at` with `limit_runs` cap.
+- `since` further narrows the candidate set before the cap.
+- Empty windows return a valid zeroed payload (not an error).
+
+### Response shape
+
+- `runtime_type`
+- `window`: `{since, limit_runs, selected_runs}`
+- `runs`:
+  - `total`, `completed`, `running`, `error`
+  - `failed`: counts both infra errors (`status=error`) and completed runs
+    where `succeeded=false`
+  - `failure_rate`: `failed / total`
+  - `by_run_type`: map of run_type -> count
+- `node_durations`: per-node timing stats computed from `run_nodes`
+  `started_at`/`finished_at`:
+  - `count`, `avg_seconds`, `p95_seconds`
+
+### Implementation decisions
+
+- SQL-only aggregation foundation (SQLite queries, no new dependencies).
+- p95 uses nearest-rank over collected per-node durations.
+- No model-registry metric join in v1; that is a follow-up once teams define
+  how training metrics and inference/business metrics should be combined.
+
+## Scheduler design (F3)
+
+This is the design for roadmap #6 scheduling v1: a built-in clock that can
+launch pipeline runs continuously without external orchestration.
+
+### Goals
+
+- Trigger pipeline runs on a schedule with no external scheduler dependency.
+- Reuse the existing run path (`Manager.run` + `RunStore`) unchanged.
+- Keep scheduling state auditable and queryable in SQLite.
+- Prevent runaway overlap by making overlap behavior explicit.
+
+### Schedule storage
+
+Add a `schedules` table:
+
+- `schedule_id` TEXT PRIMARY KEY
+- `runtime_type` TEXT NOT NULL
+- `payload` TEXT NOT NULL (JSON request payload for each scheduled run)
+- `run_type` TEXT NOT NULL (default `scheduled`, same slug rules)
+- `interval_seconds` INTEGER NOT NULL (minimum clamp, e.g. 30)
+- `enabled` INTEGER NOT NULL DEFAULT 1
+- `overlap_policy` TEXT NOT NULL (`skip` | `queue`)
+- `next_run_at` TEXT NOT NULL (UTC ISO8601)
+- `last_run_at` TEXT
+- `last_run_id` TEXT
+- `last_error` TEXT
+- `created_at` TEXT NOT NULL
+- `updated_at` TEXT NOT NULL
+
+Why interval-based first (not cron): lower parsing risk and enough power for
+MVP continuous operation. Cron syntax can be additive later.
+
+### Runtime model
+
+- Start one daemon scheduler thread during app lifespan.
+- Poll due schedules every short tick (e.g. 1s).
+- For each enabled schedule with `next_run_at <= now`:
+  - `skip` policy: if that schedule already has an in-flight run, advance
+    `next_run_at` and do not launch another run.
+  - `queue` policy: launch another run and keep advancing `next_run_at` by
+    interval.
+- Scheduled runs are normal pipeline runs written to `runs`; only invocation
+  source changes.
+
+### Labeling and lineage
+
+- Default scheduled `run_type` is `scheduled`.
+- Allow override per schedule so teams can route/filter scheduled runs like
+  any other run_type.
+- Persist `last_run_id` on each schedule for quick drill-through.
+
+### API shape (planned for F4)
+
+- `POST /v2/schedules` -> create schedule
+- `GET /v2/schedules` -> list schedules
+- `GET /v2/schedules/{schedule_id}` -> schedule detail/status
+- `PUT /v2/schedules/{schedule_id}` -> update payload/interval/enabled/policy
+- `DELETE /v2/schedules/{schedule_id}` -> delete schedule
+- `POST /v2/schedules/{schedule_id}/run-now` -> trigger immediate run
+
+### Validation and safety rules
+
+- `runtime_type` must exist.
+- `payload` must be a JSON object.
+- `run_type` must pass existing slug validation.
+- `interval_seconds` clamped to sane bounds (e.g. 30..86400).
+- Mutating schedule endpoints use the existing API-key gate behavior.
+
+### Deferred decisions
+
+- Cron expressions (`crontab`) and timezone-aware schedules.
+- Distributed leader-election (single-process scheduler for now).
+- Misfire backfill policy if the process was down (run missed ticks vs skip).
 
 ## API surface
 
@@ -412,10 +532,17 @@ This keeps existing run APIs intact while enabling direct filtering by
 | --- | --- | --- |
 | GET | `/health` | Liveness check |
 | GET | `/v2/runtimes` | List available runtime types (one per YAML) |
+| GET | `/v2/runtimes/{runtime_type}/stats` | Monitoring summary for recent runs of one runtime |
 | POST | `/v2/pipelines/{runtime_type}/run` | Run a pipeline with a JSON body (add `?async=true` for 202 + background execution) |
 | POST | `/v2/backfills` | Start an async backfill batch across many windows |
 | GET | `/v2/backfills/{backfill_id}` | Backfill batch summary/status |
 | GET | `/v2/backfills/{backfill_id}/runs` | Paginated child runs for one backfill |
+| POST | `/v2/schedules` | Create a recurring schedule (returns 201 + schedule object) |
+| GET | `/v2/schedules` | List all schedules |
+| GET | `/v2/schedules/{schedule_id}` | Get one schedule by id |
+| PUT | `/v2/schedules/{schedule_id}` | Update a schedule (interval_seconds, enabled, overlap_policy, payload) |
+| DELETE | `/v2/schedules/{schedule_id}` | Delete a schedule |
+| POST | `/v2/schedules/{schedule_id}/run-now` | Trigger an immediate run of a schedule (async execution within same request) |
 | GET | `/v2/runs` | Run history, newest first (`?run_type=` / `?runtime_type=` / `?status=` / `?limit=`) |
 | GET | `/v2/runs/{run_id}` | Full run record: status, request, per-node resolved inputs + outputs |
 | POST | `/v2/runs/{run_id}/replay/{node_id}` | Re-run one completed node against recorded inputs; returns replay output + structural diff (`added`/`removed`/`changed`) |

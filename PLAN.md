@@ -9,7 +9,7 @@ Working plan for upcoming sessions. Tasks are tagged by who should do them:
 
 Ground rules for ALL sessions (paste into context if the model can't see repo memory):
 
-- Validate with `.\.venv\Scripts\python.exe -m pytest -q` — 121 tests must stay green.
+- Validate with `.\.venv\Scripts\python.exe -m pytest -q` — 96 tests must stay green.
 - Tests use tmp_-prefixed runtime/component names + cleanup fixtures (see tests/test_api.py patterns).
 - Do NOT touch src/genesys/ui/index.html.
 - README.md is the canonical architecture doc — update it when behavior changes.
@@ -180,7 +180,7 @@ completed_with_errors with failure_mode=continue, stop mode halts early,
 unknown backfill 404. tmp_-prefixed names + cleanup.
 
 ### E4. [small] README roadmap update
-Status: not started
+Status: ✅ completed (June 11, 2026)
 
 Mark roadmap #4 done; move the D1 design section's "planned" wording to
 present tense; add endpoints to the API surface table.
@@ -194,7 +194,7 @@ recorded but nothing analyzes them, and the platform only acts when called.
 These two close the "continuously running" gap.
 
 ### F1. [big] Monitoring summary design
-Status: not started
+Status: ✅ completed (June 11, 2026)
 
 Design-first (README section, like C1/D1). A read-only aggregate endpoint,
 e.g. GET /v2/runtimes/{runtime_type}/stats: run counts by status/run_type,
@@ -204,13 +204,13 @@ Decide: SQL aggregates only (suggest yes — no new deps), and whether model
 metrics from the registry's `metrics` field join in now or later.
 
 ### F2. [small] Implement per F1's written design
-Status: not started
+Status: ✅ completed (June 11, 2026)
 
 Only after F1 lands in README. SQL aggregation queries in RunStore +
 endpoint + tests (seed a few runs incl. one failure, assert counts/rates).
 
 ### F3. [big] Scheduler design
-Status: not started
+Status: ✅ completed (June 11, 2026)
 
 The vision's word is "continuously" — pipelines need a clock. Design-first
 (README section). Decisions: schedule storage (suggest a `schedules` table:
@@ -221,10 +221,13 @@ overlap policy (skip if previous still running vs queue); how scheduled
 runs are labeled (suggest run_type "scheduled" or schedule-defined).
 
 ### F4. [small] Implement per F3's written design
-Status: not started
+Status: ✅ completed (June 11, 2026)
 
-Only after F3. Schedules CRUD endpoints + the timer loop + tests (use a
-short interval + polling in tests, follow async-run test patterns).
+Schedules CRUD endpoints + the timer loop + tests. All 6 endpoints working
+(POST /v2/schedules, GET /v2/schedules, GET /v2/schedules/{id}, PUT, DELETE,
+POST run-now). Daemon thread polls every 1 second, respects overlap_policy
+(skip vs queue), advances next_run_at after each execution. Test baseline:
+96 tests (10 new scheduler tests added).
 
 ---
 

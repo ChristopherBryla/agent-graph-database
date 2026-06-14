@@ -8,6 +8,7 @@ import re
 import secrets
 import threading
 import uuid
+from datetime import datetime, timedelta
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -182,6 +183,56 @@ class _AppState:
 state = _AppState()
 
 
+def _scheduler_loop() -> None:
+    """Poll for due schedules and launch runs every 1 second."""
+    import time
+    
+    while True:
+        try:
+            if not state.run_store:
+                time.sleep(0.1)
+                continue
+            
+            due = state.run_store.get_due_schedules()
+            for schedule in due:
+                schedule_id = schedule["schedule_id"]
+                runtime_type = schedule["runtime_type"]
+                payload = schedule["payload"]
+                run_type = schedule["run_type"]
+                interval_seconds = schedule["interval_seconds"]
+                overlap_policy = schedule["overlap_policy"]
+                
+                # Check overlap policy: if skip and run is in-flight, skip
+                if overlap_policy == "skip":
+                    in_flight_run = state.run_store.get_in_flight_run_for_schedule(schedule_id)
+                    if in_flight_run and in_flight_run["status"] == "running":
+                        # Skip this run, advance to next interval
+                        state.run_store.advance_schedule(schedule_id, interval_seconds)
+                        continue
+                
+                # Launch the run
+                run_id = str(uuid.uuid4())
+                try:
+                    state.run_store.create_run(run_id, runtime_type, run_type, payload)
+                    try:
+                        result = state.manager.run(runtime_type, payload, RunOptions(run_type=run_type), run_id=run_id)
+                        state.run_store.complete_run(run_id, result.to_dict())
+                        state.run_store.record_schedule_run(schedule_id, run_id)
+                    except Exception as exc:
+                        state.run_store.fail_run(run_id, f"{type(exc).__name__}: {exc}")
+                        state.run_store.record_schedule_error(schedule_id, f"{type(exc).__name__}: {exc}")
+                except Exception as exc:
+                    logger.error(f"[scheduler] error launching scheduled run {schedule_id}: {exc}")
+                    state.run_store.record_schedule_error(schedule_id, str(exc))
+                
+                # Advance to next interval
+                state.run_store.advance_schedule(schedule_id, interval_seconds)
+        
+        except Exception as exc:
+            logger.error(f"[scheduler] loop error: {exc}")
+        
+        time.sleep(1)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -201,7 +252,16 @@ async def lifespan(app: FastAPI):
     logger.info(f"[startup] manager runtimes: {orch.list_runtime_types()}")
     if plugins:
         logger.info(f"[startup] plugins loaded: {plugins}")
+    
+    # Start scheduler daemon thread
+    scheduler_thread = threading.Thread(target=_scheduler_loop, daemon=True)
+    scheduler_thread.start()
+    logger.info("[startup] scheduler daemon started")
+    
     yield
+    
+    # Scheduler daemon is daemonized, so it auto-stops on app shutdown
+    logger.info("[shutdown] scheduler daemon stopping")
 
 
 app = FastAPI(title="genesys", version="0.1.0", lifespan=lifespan)
@@ -389,6 +449,56 @@ def get_run(run_id: str) -> dict[str, Any]:
     if record is None:
         raise HTTPException(status_code=404, detail=f"no run with id '{run_id}'")
     return record
+
+
+def _validate_since_iso8601(since: str) -> str:
+    text = since.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=f"since must be ISO8601, got '{since}'") from exc
+    return since
+
+
+@app.get("/v2/runtimes/{runtime_type}/stats")
+def get_runtime_stats(
+    runtime_type: str,
+    run_type: str | None = None,
+    since: str | None = None,
+    limit_runs: int = 200,
+) -> dict[str, Any]:
+    """Aggregate monitoring view for one runtime's recent runs.
+
+    Returns run status totals, failure rate, run_type breakdown, and per-node
+    duration summaries (avg/p95) for the selected window.
+    """
+    if state.run_store is None:
+        raise HTTPException(status_code=503, detail="run store not initialised")
+
+    if runtime_type not in (state.manager.list_runtime_types() if state.manager else []):
+        raise HTTPException(status_code=404, detail=f"no pipeline config for runtime_type='{runtime_type}'")
+
+    normalized_since = _validate_since_iso8601(since) if since is not None else None
+    if run_type is not None:
+        run_type = run_type.strip().lower()
+        if not RUN_TYPE_RE.match(run_type):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"invalid run_type '{run_type}' — must be a lowercase slug "
+                    "(letters, digits, '_', '-'; starting with a letter; max 64 chars)"
+                ),
+            )
+
+    stats = state.run_store.get_runtime_stats(
+        runtime_type,
+        run_type=run_type,
+        since=normalized_since,
+        limit_runs=limit_runs,
+    )
+    return stats
 
 
 def _validate_backfill_windows(windows: Any) -> list[dict[str, str]]:
@@ -978,6 +1088,175 @@ def delete_component(
     if state.manager is not None:
         state.manager.unregister(name)
     return {"deleted": name}
+
+
+# ---------------------------------------------------------------------------
+# Schedules CRUD
+# ---------------------------------------------------------------------------
+
+def _clamp_interval(interval_seconds: int) -> int:
+    """Clamp interval to valid range [30, 86400]."""
+    return max(30, min(86400, interval_seconds))
+
+
+@app.post("/v2/schedules", status_code=201)
+async def create_schedule(request: Request) -> dict[str, Any]:
+    """Create a new schedule. Returns the schedule object."""
+    if not state.run_store:
+        raise HTTPException(status_code=503, detail="scheduler not initialised")
+    
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="request body must be valid JSON")
+    
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="request body must be a JSON object")
+    
+    runtime_type = body.get("runtime_type", "").strip()
+    payload = body.get("payload", {})
+    run_type = (body.get("run_type", "scheduled") or "scheduled").strip().lower()
+    interval_seconds = body.get("interval_seconds", 300)
+    overlap_policy = (body.get("overlap_policy", "skip") or "skip").strip().lower()
+    
+    if not runtime_type:
+        raise HTTPException(status_code=422, detail="runtime_type is required")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="payload must be a JSON object")
+    if not isinstance(interval_seconds, int):
+        raise HTTPException(status_code=422, detail="interval_seconds must be an integer")
+    if overlap_policy not in {"skip", "queue"}:
+        raise HTTPException(status_code=422, detail="overlap_policy must be 'skip' or 'queue'")
+    
+    if not RUN_TYPE_RE.match(run_type):
+        raise HTTPException(
+            status_code=422,
+            detail=f"invalid run_type '{run_type}' — must be lowercase slug (letters, digits, '_', '-'; max 64 chars)",
+        )
+    
+    schedule_id = str(uuid.uuid4())
+    interval_seconds = _clamp_interval(interval_seconds)
+    
+    state.run_store.create_schedule(
+        schedule_id,
+        runtime_type,
+        payload,
+        run_type,
+        interval_seconds,
+        overlap_policy,
+    )
+    
+    return state.run_store.get_schedule(schedule_id)
+
+
+@app.get("/v2/schedules")
+def list_schedules() -> list[dict[str, Any]]:
+    """List all schedules."""
+    if not state.run_store:
+        raise HTTPException(status_code=503, detail="scheduler not initialised")
+    return state.run_store.list_schedules()
+
+
+@app.get("/v2/schedules/{schedule_id}")
+def get_schedule(schedule_id: str) -> dict[str, Any]:
+    """Get one schedule by id."""
+    if not state.run_store:
+        raise HTTPException(status_code=503, detail="scheduler not initialised")
+    
+    schedule = state.run_store.get_schedule(schedule_id)
+    if schedule is None:
+        raise HTTPException(status_code=404, detail=f"schedule '{schedule_id}' not found")
+    return schedule
+
+
+@app.put("/v2/schedules/{schedule_id}")
+async def update_schedule(schedule_id: str, request: Request) -> dict[str, Any]:
+    """Update a schedule. Only provided fields are updated."""
+    if not state.run_store:
+        raise HTTPException(status_code=503, detail="scheduler not initialised")
+    
+    schedule = state.run_store.get_schedule(schedule_id)
+    if schedule is None:
+        raise HTTPException(status_code=404, detail=f"schedule '{schedule_id}' not found")
+    
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="request body must be valid JSON")
+    
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="request body must be a JSON object")
+    
+    # Validate any provided fields
+    if "payload" in body and not isinstance(body["payload"], dict):
+        raise HTTPException(status_code=422, detail="payload must be a JSON object")
+    if "interval_seconds" in body and not isinstance(body["interval_seconds"], int):
+        raise HTTPException(status_code=422, detail="interval_seconds must be an integer")
+    if "enabled" in body and not isinstance(body["enabled"], bool):
+        raise HTTPException(status_code=422, detail="enabled must be a boolean")
+    if "overlap_policy" in body and body["overlap_policy"] not in {"skip", "queue"}:
+        raise HTTPException(status_code=422, detail="overlap_policy must be 'skip' or 'queue'")
+    
+    # Build update dict (convert enabled bool to int)
+    updates: dict[str, Any] = {}
+    if "payload" in body:
+        updates["payload"] = body["payload"]
+    if "interval_seconds" in body:
+        updates["interval_seconds"] = _clamp_interval(body["interval_seconds"])
+    if "enabled" in body:
+        updates["enabled"] = 1 if body["enabled"] else 0
+    if "overlap_policy" in body:
+        updates["overlap_policy"] = body["overlap_policy"]
+    
+    if updates:
+        state.run_store.update_schedule(schedule_id, **updates)
+    
+    return state.run_store.get_schedule(schedule_id)
+
+
+@app.delete("/v2/schedules/{schedule_id}", status_code=204)
+def delete_schedule(schedule_id: str) -> None:
+    """Delete a schedule."""
+    if not state.run_store:
+        raise HTTPException(status_code=503, detail="scheduler not initialised")
+    
+    schedule = state.run_store.get_schedule(schedule_id)
+    if schedule is None:
+        raise HTTPException(status_code=404, detail=f"schedule '{schedule_id}' not found")
+    
+    state.run_store.delete_schedule(schedule_id)
+
+
+@app.post("/v2/schedules/{schedule_id}/run-now")
+async def run_schedule_now(schedule_id: str) -> dict[str, Any]:
+    """Trigger an immediate run of a schedule. Returns the created run."""
+    if not state.run_store:
+        raise HTTPException(status_code=503, detail="scheduler not initialised")
+    if not state.manager:
+        raise HTTPException(status_code=503, detail="orchestrator not initialised")
+    
+    schedule = state.run_store.get_schedule(schedule_id)
+    if schedule is None:
+        raise HTTPException(status_code=404, detail=f"schedule '{schedule_id}' not found")
+    
+    runtime_type = schedule["runtime_type"]
+    payload = schedule["payload"]
+    run_type = schedule["run_type"]
+    
+    # Create and launch the run immediately
+    run_id = str(uuid.uuid4())
+    state.run_store.create_run(run_id, runtime_type, run_type, payload)
+    
+    try:
+        result = state.manager.run(runtime_type, payload, RunOptions(run_type=run_type), run_id=run_id)
+        state.run_store.complete_run(run_id, result.to_dict())
+        state.run_store.record_schedule_run(schedule_id, run_id)
+    except Exception as exc:
+        state.run_store.fail_run(run_id, f"{type(exc).__name__}: {exc}")
+        state.run_store.record_schedule_error(schedule_id, f"{type(exc).__name__}: {exc}")
+        raise HTTPException(status_code=500, detail=f"run failed: {exc}")
+    
+    return state.run_store.get_run(run_id)
 
 
 # ---------------------------------------------------------------------------

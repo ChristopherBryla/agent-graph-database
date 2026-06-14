@@ -26,11 +26,12 @@ API reads happen concurrently.
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Generator
 
@@ -115,6 +116,25 @@ class RunStore:
                     finished_at          TEXT,
                     error                TEXT
                 );
+
+                CREATE TABLE IF NOT EXISTS schedules (
+                    schedule_id         TEXT PRIMARY KEY,
+                    runtime_type        TEXT NOT NULL,
+                    payload             TEXT NOT NULL,
+                    run_type            TEXT NOT NULL,
+                    interval_seconds    INTEGER NOT NULL,
+                    enabled             INTEGER NOT NULL DEFAULT 1,
+                    overlap_policy      TEXT NOT NULL,
+                    next_run_at         TEXT NOT NULL,
+                    last_run_at         TEXT,
+                    last_run_id         TEXT,
+                    last_error          TEXT,
+                    created_at          TEXT NOT NULL,
+                    updated_at          TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_schedules_next_run ON schedules(next_run_at);
+                CREATE INDEX IF NOT EXISTS idx_schedules_enabled ON schedules(enabled);
             """)
             self._ensure_column(conn, "runs", "parent_run_id", "TEXT")
             self._ensure_column(conn, "runs", "backfill_id", "TEXT")
@@ -373,6 +393,296 @@ class RunStore:
                 [*params, clamped_limit, clamped_offset],
             ).fetchall()
         return [self._run_metadata(r) for r in rows], int(total)
+
+    def create_schedule(
+        self,
+        schedule_id: str,
+        runtime_type: str,
+        payload: dict[str, Any],
+        run_type: str,
+        interval_seconds: int,
+        overlap_policy: str,
+        next_run_at: str | None = None,
+    ) -> None:
+        """Create a new schedule."""
+        now = _now()
+        effective_next = next_run_at if next_run_at else now
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO schedules ("
+                "schedule_id, runtime_type, payload, run_type, interval_seconds, "
+                "enabled, overlap_policy, next_run_at, created_at, updated_at"
+                ") VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)",
+                (
+                    schedule_id,
+                    runtime_type,
+                    json.dumps(payload),
+                    run_type,
+                    interval_seconds,
+                    overlap_policy,
+                    effective_next,
+                    now,
+                    now,
+                ),
+            )
+
+    def list_schedules(self) -> list[dict[str, Any]]:
+        """List all schedules (enabled and disabled)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM schedules ORDER BY created_at DESC"
+            ).fetchall()
+        return [self._schedule_record(r) for r in rows]
+
+    def get_schedule(self, schedule_id: str) -> dict[str, Any] | None:
+        """Fetch one schedule by id."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM schedules WHERE schedule_id = ?",
+                (schedule_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._schedule_record(row)
+
+    def update_schedule(
+        self,
+        schedule_id: str,
+        *,
+        payload: dict[str, Any] | None = None,
+        interval_seconds: int | None = None,
+        enabled: int | None = None,
+        overlap_policy: str | None = None,
+    ) -> None:
+        """Update schedule fields."""
+        updates: list[str] = ["updated_at = ?"]
+        params: list[Any] = [_now()]
+        if payload is not None:
+            updates.append("payload = ?")
+            params.append(json.dumps(payload))
+        if interval_seconds is not None:
+            updates.append("interval_seconds = ?")
+            params.append(interval_seconds)
+        if enabled is not None:
+            updates.append("enabled = ?")
+            params.append(enabled)
+        if overlap_policy is not None:
+            updates.append("overlap_policy = ?")
+            params.append(overlap_policy)
+        params.append(schedule_id)
+
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                f"UPDATE schedules SET {', '.join(updates)} WHERE schedule_id = ?",
+                params,
+            )
+
+    def delete_schedule(self, schedule_id: str) -> None:
+        """Delete a schedule."""
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM schedules WHERE schedule_id = ?", (schedule_id,))
+
+    def record_schedule_run(
+        self,
+        schedule_id: str,
+        run_id: str,
+    ) -> None:
+        """Update schedule after a run was launched."""
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE schedules SET last_run_at = ?, last_run_id = ?, last_error = NULL "
+                "WHERE schedule_id = ?",
+                (_now(), run_id, schedule_id),
+            )
+
+    def record_schedule_error(
+        self,
+        schedule_id: str,
+        error: str,
+    ) -> None:
+        """Record an error on a schedule (e.g. contract validation failed)."""
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE schedules SET last_error = ? WHERE schedule_id = ?",
+                (error, schedule_id),
+            )
+
+    def get_due_schedules(self) -> list[dict[str, Any]]:
+        """Get all enabled schedules where next_run_at <= now."""
+        now = _now()
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM schedules WHERE enabled = 1 AND next_run_at <= ? ORDER BY next_run_at",
+                (now,),
+            ).fetchall()
+        return [self._schedule_record(r) for r in rows]
+
+    def advance_schedule(self, schedule_id: str, interval_seconds: int) -> None:
+        """Advance a schedule's next_run_at by interval."""
+        with self._lock, self._connect() as conn:
+            current_row = conn.execute(
+                "SELECT next_run_at FROM schedules WHERE schedule_id = ?",
+                (schedule_id,),
+            ).fetchone()
+            if current_row is None:
+                return
+            current_ts = datetime.fromisoformat(current_row["next_run_at"])
+            new_ts = current_ts + timedelta(seconds=interval_seconds)
+            conn.execute(
+                "UPDATE schedules SET next_run_at = ? WHERE schedule_id = ?",
+                (new_ts.isoformat(), schedule_id),
+            )
+
+    def get_in_flight_run_for_schedule(self, schedule_id: str) -> dict[str, Any] | None:
+        """Get the last_run_id from the schedule and fetch its status."""
+        schedule = self.get_schedule(schedule_id)
+        if schedule is None or schedule["last_run_id"] is None:
+            return None
+        return self.get_run(schedule["last_run_id"])
+
+    @staticmethod
+    def _schedule_record(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schedule_id": row["schedule_id"],
+            "runtime_type": row["runtime_type"],
+            "payload": json.loads(row["payload"]),
+            "run_type": row["run_type"],
+            "interval_seconds": row["interval_seconds"],
+            "enabled": bool(row["enabled"]),
+            "overlap_policy": row["overlap_policy"],
+            "next_run_at": row["next_run_at"],
+            "last_run_at": row["last_run_at"],
+            "last_run_id": row["last_run_id"],
+            "last_error": row["last_error"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def get_runtime_stats(
+        self,
+        runtime_type: str,
+        *,
+        run_type: str | None = None,
+        since: str | None = None,
+        limit_runs: int = 200,
+    ) -> dict[str, Any]:
+        """Aggregate run and node-duration stats for one runtime.
+
+        Windowing supports either:
+        - latest N runs (`limit_runs`), optionally narrowed by run_type
+        - a started_at lower bound (`since`) plus limit_runs cap
+        """
+        clauses = ["runtime_type = ?"]
+        params: list[Any] = [runtime_type]
+        if run_type is not None:
+            clauses.append("run_type = ?")
+            params.append(run_type)
+        if since is not None:
+            clauses.append("started_at >= ?")
+            params.append(since)
+        where = " AND ".join(clauses)
+        clamped_limit = max(1, min(limit_runs, 1000))
+
+        with self._connect() as conn:
+            selected_runs = conn.execute(
+                f"SELECT run_id, status, succeeded, run_type FROM runs "
+                f"WHERE {where} ORDER BY started_at DESC LIMIT ?",
+                [*params, clamped_limit],
+            ).fetchall()
+
+            total_runs = len(selected_runs)
+            if total_runs == 0:
+                return {
+                    "runtime_type": runtime_type,
+                    "window": {
+                        "since": since,
+                        "limit_runs": clamped_limit,
+                        "selected_runs": 0,
+                    },
+                    "runs": {
+                        "total": 0,
+                        "completed": 0,
+                        "running": 0,
+                        "error": 0,
+                        "failed": 0,
+                        "failure_rate": 0.0,
+                        "by_run_type": {},
+                    },
+                    "node_durations": [],
+                }
+
+            run_ids = [r["run_id"] for r in selected_runs]
+            run_placeholders = ",".join("?" for _ in run_ids)
+
+            counts = conn.execute(
+                f"SELECT "
+                f"COUNT(*) AS total, "
+                f"SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed, "
+                f"SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END) AS running, "
+                f"SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS error, "
+                f"SUM(CASE WHEN status = 'error' OR (status = 'completed' AND COALESCE(succeeded, 0) = 0) THEN 1 ELSE 0 END) AS failed "
+                f"FROM runs WHERE run_id IN ({run_placeholders})",
+                run_ids,
+            ).fetchone()
+
+            by_run_type_rows = conn.execute(
+                f"SELECT run_type, COUNT(*) AS c "
+                f"FROM runs WHERE run_id IN ({run_placeholders}) "
+                f"GROUP BY run_type ORDER BY run_type",
+                run_ids,
+            ).fetchall()
+
+            duration_rows = conn.execute(
+                f"SELECT node_id, (finished_at - started_at) AS duration "
+                f"FROM run_nodes "
+                f"WHERE run_id IN ({run_placeholders}) "
+                f"AND started_at IS NOT NULL AND finished_at IS NOT NULL "
+                f"AND finished_at >= started_at",
+                run_ids,
+            ).fetchall()
+
+        durations_by_node: dict[str, list[float]] = {}
+        for row in duration_rows:
+            node_id = str(row["node_id"])
+            durations_by_node.setdefault(node_id, []).append(float(row["duration"]))
+
+        node_durations: list[dict[str, Any]] = []
+        for node_id in sorted(durations_by_node.keys()):
+            values = sorted(durations_by_node[node_id])
+            count = len(values)
+            avg_value = sum(values) / count
+            p95_index = max(0, math.ceil(0.95 * count) - 1)
+            node_durations.append(
+                {
+                    "node_id": node_id,
+                    "count": count,
+                    "avg_seconds": round(avg_value, 6),
+                    "p95_seconds": round(values[p95_index], 6),
+                }
+            )
+
+        failed = int(counts["failed"] or 0)
+        total = int(counts["total"] or 0)
+        failure_rate = (failed / total) if total else 0.0
+
+        return {
+            "runtime_type": runtime_type,
+            "window": {
+                "since": since,
+                "limit_runs": clamped_limit,
+                "selected_runs": total,
+            },
+            "runs": {
+                "total": total,
+                "completed": int(counts["completed"] or 0),
+                "running": int(counts["running"] or 0),
+                "error": int(counts["error"] or 0),
+                "failed": failed,
+                "failure_rate": round(failure_rate, 6),
+                "by_run_type": {str(r["run_type"]): int(r["c"]) for r in by_run_type_rows},
+            },
+            "node_durations": node_durations,
+        }
 
     @staticmethod
     def _run_metadata(row: sqlite3.Row) -> dict[str, Any]:
